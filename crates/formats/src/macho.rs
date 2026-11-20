@@ -7,74 +7,28 @@ use crate::bytes::Reader;
 use crate::{FormatError, hex_addr};
 use serde::Serialize;
 use serde_json::json;
+use std::collections::BTreeSet;
 
 const MAX_CMDS: usize = 4096;
 const MAX_INDIRECT: usize = 500_000;
 const MAX_OBJC: usize = 50_000;
 const MAX_METHODS: usize = 4096;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct FatSlice {
-    pub arch: String,
-    pub cputype: u32,
-    pub cpusubtype: u32,
-    pub offset: u64,
-    pub size: u64,
-    pub align: u32,
-}
+pub(crate) use craft_macho::load_command_min_size;
+pub use craft_macho::{FatSlice, cpu_name, load_command_name};
+use craft_macho::{nibble_version, unixthread_pc};
 
-pub fn cpu_name(cputype: u32, sub: u32) -> String {
-    match cputype {
-        7 => "i386".into(),
-        0x0100_0007 if sub & 0x00ff_ffff == 8 => "x86_64h".into(),
-        0x0100_0007 => "x86_64".into(),
-        12 => "arm".into(),
-        0x0100_000c => {
-            if sub & 0xff == 2 {
-                "arm64e".into()
-            } else {
-                "arm64".into()
-            }
-        }
-        0x0200_000c => "arm64_32".into(),
-        18 => "ppc".into(),
-        0x0100_0012 => "ppc64".into(),
-        other => format!("cpu{other:#x}"),
-    }
-}
-
-/// The slices of a universal (fat) binary.
+/// The slices of a universal binary, preserving the app error contract.
 pub fn fat_slices(data: &[u8]) -> Result<Vec<FatSlice>, FormatError> {
-    let r = Reader::new(data);
-    let magic = r.u32_be(0).ok_or_else(|| FormatError::Truncated("fat header".into()))?;
-    let wide = match magic {
-        0xcafe_babe => false,
-        0xcafe_babf => true,
-        _ => return Err(FormatError::Malformed("not a universal binary".into())),
-    };
-    let n = r.u32_be(4).ok_or_else(|| FormatError::Truncated("fat header".into()))? as usize;
-    if n == 0 || n > 64 {
-        return Err(FormatError::Malformed(format!("{n} slices (Java class files share this magic)")));
-    }
-    let mut out = Vec::new();
-    for i in 0..n {
-        let s = if wide {
-            let o = 8 + i * 32;
-            (r.u32_be(o), r.u32_be(o + 4), r.u64_be(o + 8), r.u64_be(o + 16), r.u32_be(o + 24))
-        } else {
-            let o = 8 + i * 20;
-            (r.u32_be(o), r.u32_be(o + 4), r.u32_be(o + 8).map(u64::from), r.u32_be(o + 12).map(u64::from), r.u32_be(o + 16))
-        };
-        let (Some(cpu), Some(sub), Some(offset), Some(size), Some(align)) = s else {
-            return Err(FormatError::Truncated("fat arch table".into()));
-        };
-        if offset.checked_add(size).is_none_or(|end| end > data.len() as u64) {
-            return Err(FormatError::Truncated(format!("slice {i} runs past the end of the file")));
-        }
-        out.push(FatSlice { arch: cpu_name(cpu, sub), cputype: cpu, cpusubtype: sub, offset, size, align });
-    }
-    Ok(out)
+    craft_macho::fat_slices(data).map_err(|error| match error {
+        craft_macho::MachoError::Truncated(context) => FormatError::Truncated(context),
+        craft_macho::MachoError::Malformed(context) => FormatError::Malformed(context),
+    })
 }
+
+#[cfg(test)]
+#[path = "macho_legacy.rs"]
+mod legacy;
 
 #[derive(Debug, Clone)]
 struct MSection {
@@ -91,61 +45,7 @@ struct MSegment {
     name: String,
     vmaddr: u64,
     fileoff: u64,
-}
-
-pub fn load_command_name(cmd: u32) -> String {
-    match cmd {
-        0x1 => "LC_SEGMENT",
-        0x2 => "LC_SYMTAB",
-        0x5 => "LC_UNIXTHREAD",
-        0xb => "LC_DYSYMTAB",
-        0xc => "LC_LOAD_DYLIB",
-        0xd => "LC_ID_DYLIB",
-        0xe => "LC_LOAD_DYLINKER",
-        0x19 => "LC_SEGMENT_64",
-        0x1b => "LC_UUID",
-        0x1d => "LC_CODE_SIGNATURE",
-        0x1e => "LC_SEGMENT_SPLIT_INFO",
-        0x20 => "LC_LAZY_LOAD_DYLIB",
-        0x21 => "LC_ENCRYPTION_INFO",
-        0x22 => "LC_DYLD_INFO",
-        0x8000_0022 => "LC_DYLD_INFO_ONLY",
-        0x24 => "LC_VERSION_MIN_MACOSX",
-        0x25 => "LC_VERSION_MIN_IPHONEOS",
-        0x26 => "LC_FUNCTION_STARTS",
-        0x29 => "LC_DATA_IN_CODE",
-        0x2a => "LC_SOURCE_VERSION",
-        0x2c => "LC_ENCRYPTION_INFO_64",
-        0x32 => "LC_BUILD_VERSION",
-        0x8000_0018 => "LC_LOAD_WEAK_DYLIB",
-        0x8000_001c => "LC_RPATH",
-        0x8000_001f => "LC_REEXPORT_DYLIB",
-        0x8000_0028 => "LC_MAIN",
-        0x8000_0033 => "LC_DYLD_EXPORTS_TRIE",
-        0x8000_0034 => "LC_DYLD_CHAINED_FIXUPS",
-        other => return format!("{other:#x}"),
-    }
-    .into()
-}
-
-fn platform_name(p: u32) -> &'static str {
-    match p {
-        1 => "macos",
-        2 => "ios",
-        3 => "tvos",
-        4 => "watchos",
-        5 => "bridgeos",
-        6 => "mac-catalyst",
-        7 => "ios-simulator",
-        8 => "tvos-simulator",
-        9 => "watchos-simulator",
-        11 => "visionos",
-        _ => "unknown",
-    }
-}
-
-fn nibble_version(v: u32) -> String {
-    format!("{}.{}.{}", v >> 16, (v >> 8) & 0xff, v & 0xff)
+    filesize: u64,
 }
 
 /// Add Mach-O facts. `data` is the (thin) slice.
@@ -161,8 +61,13 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
         return;
     }
     let ncmds = r.u32_le(16).unwrap_or(0) as usize;
+    let sizeofcmds = r.u32_le(20).unwrap_or(0) as usize;
     let header_flags = r.u32_le(24).unwrap_or(0);
-    let mut pos = if is64 { 32 } else { 28 };
+    let mut pos: usize = if is64 { 32 } else { 28 };
+    let limit = pos.saturating_add(sizeofcmds).min(data.len());
+    if sizeofcmds > data.len().saturating_sub(pos) {
+        b.warnings.push("sizeofcmds runs past the end of the file".into());
+    }
     let mut sections = Vec::new();
     let mut segments = Vec::new();
     let mut symtab = None;
@@ -171,8 +76,13 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
     let mut thread_pc = None;
     let mut fstarts = None;
     let mut cmds_json = Vec::new();
-    let mut libs = Vec::new();
+    // Preserve each dependency's ordinal even when its load command has no usable path.
+    let mut dylib_ordinals = Vec::new();
     for _ in 0..ncmds.min(MAX_CMDS) {
+        if pos.checked_add(8).is_none_or(|end| end > limit) {
+            b.warnings.push("load command header runs past sizeofcmds; stopped".into());
+            break;
+        }
         let (Some(cmd), Some(size)) = (r.u32_le(pos), r.u32_le(pos + 4)) else {
             b.warnings.push("load commands cut short".into());
             break;
@@ -182,15 +92,30 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
             b.warnings.push("a load command has a size below 8; stopped".into());
             break;
         }
+        let Some(end) = pos.checked_add(size).filter(|&end| end <= limit) else {
+            b.warnings.push("a load command runs past sizeofcmds; stopped".into());
+            break;
+        };
         if cmds_json.len() < 512 {
             cmds_json.push(json!({"cmd": load_command_name(cmd), "size": size}));
         }
+        let minimum = load_command_min_size(cmd);
+        let is_dylib = matches!(cmd, 0xc | 0x20 | 0x8000_0018 | 0x8000_001f | 0x8000_0023);
+        if size < minimum {
+            if is_dylib {
+                dylib_ordinals.push(None);
+            }
+            b.warnings.push(format!("{} needs at least {minimum} bytes; skipped its fields", load_command_name(cmd)));
+            pos = end;
+            continue;
+        }
+        let r = Reader::new(data.get(..end).unwrap_or(&[]));
         let str_at = |field: usize| -> Option<String> {
             let o = r.u32_le(pos + field)? as usize;
-            if o >= size {
+            if o < minimum || o >= size {
                 return None;
             }
-            r.cstr(pos + o, size - o)
+            Some(std::ffi::CStr::from_bytes_until_nul(r.slice(pos + o, size - o)?).ok()?.to_string_lossy().into_owned())
         };
         match cmd {
             0x19 | 0x1 => {
@@ -198,13 +123,15 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
                 let name = r.cstr(pos + name_o, 16).unwrap_or_default();
                 let vmaddr = if cmd == 0x19 { r.u64_le(pos + vm) } else { r.u32_le(pos + vm).map(u64::from) }.unwrap_or(0);
                 let fileoff = if cmd == 0x19 { r.u64_le(pos + fo) } else { r.u32_le(pos + fo).map(u64::from) }.unwrap_or(0);
-                segments.push(MSegment { name, vmaddr, fileoff });
+                let filesize = if cmd == 0x19 { r.u64_le(pos + fo + 8) } else { r.u32_le(pos + fo + 4).map(u64::from) }.unwrap_or(0);
+                segments.push(MSegment { name, vmaddr, fileoff, filesize });
                 let nsects = r.u32_le(pos + ns).unwrap_or(0) as usize;
-                for i in 0..nsects.min(256) {
+                let complete = (size - sh) / shsize;
+                if nsects > complete {
+                    b.warnings.push("segment section headers run past the load command; reading complete headers".into());
+                }
+                for i in 0..nsects.min(256).min(complete) {
                     let o = pos + sh + i * shsize;
-                    if o + shsize > pos + size {
-                        break;
-                    }
                     let (addr, sz, flags_o) = if cmd == 0x19 {
                         (r.u64_le(o + 32), r.u64_le(o + 40), 64)
                     } else {
@@ -225,11 +152,7 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
                     Some((r.u32_le(pos + 8).unwrap_or(0), r.u32_le(pos + 12).unwrap_or(0), r.u32_le(pos + 16).unwrap_or(0), r.u32_le(pos + 20).unwrap_or(0)))
             }
             0xb => indirect = Some((r.u32_le(pos + 56).unwrap_or(0), r.u32_le(pos + 60).unwrap_or(0))),
-            0xc | 0x20 | 0x8000_0018 | 0x8000_001f | 0x8000_0023 => {
-                if let Some(s) = str_at(8) {
-                    libs.push(s);
-                }
-            }
+            _ if is_dylib => dylib_ordinals.push(str_at(8)),
             0xd => {
                 if let Some(s) = str_at(8) {
                     b.info.insert("install_name".into(), s);
@@ -254,20 +177,14 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
             }
             0x8000_0028 => entryoff = r.u64_le(pos + 8),
             0x5 => {
-                // flavor, count, state…
-                let state = pos + 16;
-                thread_pc = match r.u32_le(pos + 8) {
-                    Some(4) => r.u64_le(state + 16 * 8),                         // x86_THREAD_STATE64: rip
-                    Some(6) => r.u64_le(state + 32 * 8),                         // ARM_THREAD_STATE64: pc
-                    Some(1) if !is64 => r.u32_le(state + 10 * 4).map(u64::from), // i386: eip
-                    _ => None,
-                };
+                thread_pc = thread_pc.or_else(|| unixthread_pc(data.get(pos + 8..end)?, r.u32_le(4)?, is64));
             }
             0x26 => fstarts = Some((r.u32_le(pos + 8).unwrap_or(0), r.u32_le(pos + 12).unwrap_or(0))),
             0x1d => b.mitigations.code_signature = Some(true),
             0x21 | 0x2c => b.mitigations.encrypted = Some(r.u32_le(pos + 16).unwrap_or(0) != 0),
             0x32 => {
-                b.info.insert("platform".into(), platform_name(r.u32_le(pos + 8).unwrap_or(0)).into());
+                // One platform table for the binary and the dependency views.
+                b.info.insert("platform".into(), crate::macho_deps::platform_name(r.u32_le(pos + 8).unwrap_or(0)));
                 b.info.insert("min_os".into(), nibble_version(r.u32_le(pos + 12).unwrap_or(0)));
                 b.info.insert("sdk".into(), nibble_version(r.u32_le(pos + 16).unwrap_or(0)));
             }
@@ -283,22 +200,19 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
             }
             _ => {}
         }
-        pos = match pos.checked_add(size) {
-            Some(p) => p,
-            None => break,
-        };
+        pos = end;
     }
-    b.libraries = libs;
     if b.mitigations.code_signature.is_none() {
         b.mitigations.code_signature = Some(false);
     }
     b.mitigations.pie = Some(header_flags & 0x0020_0000 != 0);
     b.mitigations.nx = Some(header_flags & 0x0002_0000 == 0);
     let text = segments.iter().find(|s| s.name == "__TEXT").cloned();
-    // Entry point.
+    // Entry point. LC_MAIN gives a file offset: map it through the segment whose file bytes hold
+    // it. Segments with no file bytes (__PAGEZERO, a __DATA of only zero-fill sections) usually
+    // record file offset 0, like __TEXT, and must not claim it.
     if let Some(off) = entryoff {
-        let seg = segments.iter().filter(|s| s.fileoff <= off && s.name != "__PAGEZERO").max_by_key(|s| s.fileoff);
-        b.entry = seg.map(|s| s.vmaddr.wrapping_add(off - s.fileoff));
+        b.entry = segments.iter().find_map(|s| off.checked_sub(s.fileoff).filter(|&d| d < s.filesize).map(|d| s.vmaddr.wrapping_add(d)));
     } else if let Some(pc) = thread_pc {
         b.entry = Some(pc);
     } else {
@@ -309,15 +223,24 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
     }
     // Function starts: ULEB deltas from the start of __TEXT.
     if let (Some((off, size)), Some(t)) = (fstarts, &text) {
-        let mut o = off as usize;
+        let start = off as usize;
         let end = (off as usize).saturating_add(size as usize).min(data.len());
+        let starts = Reader::new(data.get(start..end).unwrap_or(&[]));
+        let mut o = 0;
         let mut addr = t.vmaddr;
-        while o < end && b.function_starts.len() < 2_000_000 {
-            let Some((delta, n)) = r.uleb128(o) else { break };
+        while o < starts.len() && b.function_starts.len() < 2_000_000 {
+            let Some((delta, n)) = starts.uleb128(o) else {
+                b.warnings.push("function-start delta is cut short or invalid".into());
+                break;
+            };
             if delta == 0 {
                 break;
             }
-            addr = addr.wrapping_add(delta);
+            let Some(next) = addr.checked_add(delta) else {
+                b.warnings.push("function-start address overflows".into());
+                break;
+            };
+            addr = next;
             b.function_starts.push(addr);
             o += n;
         }
@@ -337,7 +260,8 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
             let desc = r.u16_le(e + 6)?;
             Some((r.cstr(stroff as usize + strx as usize, (strsize - strx) as usize)?, desc))
         };
-        for s in &sections {
+        let mut remaining = MAX_INDIRECT;
+        'sections: for s in &sections {
             let ty = s.flags & 0xff;
             let (entsize, kind) = match ty {
                 6 | 7 | 0x10 => (if is64 { 8 } else { 4 }, "slot"),
@@ -347,24 +271,29 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
             if entsize == 0 {
                 continue;
             }
-            let count = (s.size / entsize) as usize;
-            for i in 0..count.min(MAX_INDIRECT) {
+            let count = usize::try_from(s.size / entsize).unwrap_or(usize::MAX);
+            for i in 0..count {
                 let Some(ii) = (s.reserved1 as usize).checked_add(i) else { break };
                 if ii >= nind as usize {
                     break;
                 }
+                if remaining == 0 {
+                    b.warnings.push("indirect symbol limit reached across sections; remaining slots omitted".into());
+                    break 'sections;
+                }
+                remaining -= 1;
                 let Some(sym) = r.u32_le(indoff as usize + ii * 4) else { break };
                 if sym & 0xc000_0000 != 0 {
                     continue;
                 }
                 let Some((name, desc)) = sym_name(sym) else { continue };
                 let ord = usize::from(desc >> 8);
-                let library = if ord > 0 && ord < 0xfe { b.libraries.get(ord - 1).cloned() } else { None };
+                let library = if ord > 0 && ord < 0xfe { dylib_ordinals.get(ord - 1).cloned().flatten() } else { None };
                 b.import_slots.push(ImportSlot { addr: s.addr.wrapping_add(i as u64 * entsize), name, library, kind });
             }
         }
     }
-    // Libraries for imports, by two-level namespace ordinal.
+    b.libraries = dylib_ordinals.into_iter().flatten().collect();
     b.details = json!({
         "file_type": match r.u32_le(12) { Some(1) => "object", Some(2) => "execute", Some(6) => "dylib", Some(8) => "bundle", Some(4) => "core", _ => "other" },
         "flags": format!("{header_flags:#x}"),
@@ -471,13 +400,13 @@ fn method_list(data: &[u8], b: &Binary, list: u64, kind: &'static str, out: &mut
     let (Some(ent_flags), Some(count)) = (r.u32_le(0), r.u32_le(4)) else { return };
     let relative = ent_flags & 0x8000_0000 != 0;
     let entsize = u64::from(ent_flags & 0xfffc);
-    if entsize == 0 {
+    if entsize < if relative { 12 } else { 24 } {
         return;
     }
     for i in 0..u64::from(count).min(MAX_METHODS as u64) {
         let Some(e) = i.checked_mul(entsize).and_then(|offset| list.checked_add(8)?.checked_add(offset)) else { break };
+        let Some(raw) = b.read(data, e, entsize as usize).filter(|bytes| bytes.len() as u64 == entsize) else { break };
         if relative {
-            let Some(raw) = b.read(data, e, 12) else { break };
             let rr = Reader::new(raw);
             let rel = |o: usize| rr.u32_le(o).and_then(|v| e.checked_add(o as u64).map(|a| a.wrapping_add(i64::from(v as i32) as u64)));
             let name_field = rel(0);
@@ -516,7 +445,11 @@ pub fn objc_metadata(data: &[u8], b: &Binary) -> ObjcMetadata {
         m.warnings.push("Objective-C metadata is decoded for 64-bit images only".into());
         return m;
     }
+    let mut seen_classes = BTreeSet::new();
     for class in section_words(data, b, &["__objc_classlist", "__objc_nlclslist"]) {
+        if seen_classes.contains(&class) {
+            continue;
+        }
         if m.classes.len() >= MAX_OBJC {
             break;
         }
@@ -524,6 +457,7 @@ pub fn objc_metadata(data: &[u8], b: &Binary) -> ObjcMetadata {
             m.warnings.push(format!("class at {class:#x}: unreadable name"));
             continue;
         };
+        seen_classes.insert(class);
         let mut methods = Vec::new();
         if let Some(ro) = class_ro(data, b, class)
             && let Some(list) = ptr_at(data, b, ro + 0x20)
@@ -540,11 +474,16 @@ pub fn objc_metadata(data: &[u8], b: &Binary) -> ObjcMetadata {
         let swift = b.read_ptr(data, class + 32).is_some_and(|raw| raw & 3 != 0) || name.starts_with("_Tt");
         m.classes.push(ObjcClass { name, addr: class, superclass, category: None, methods, swift });
     }
+    let mut seen_categories = BTreeSet::new();
     for cat in section_words(data, b, &["__objc_catlist", "__objc_nlcatlist"]) {
+        if seen_categories.contains(&cat) {
+            continue;
+        }
         if m.classes.len() >= MAX_OBJC {
             break;
         }
         let Some(cat_name) = ptr_at(data, b, cat).and_then(|a| cstr_at(data, b, a)) else { continue };
+        seen_categories.insert(cat);
         let cls = ptr_at(data, b, cat + 8).and_then(|c| class_name(data, b, c)).unwrap_or_else(|| "(external class)".into());
         let mut methods = Vec::new();
         if let Some(list) = ptr_at(data, b, cat + 16) {
@@ -661,6 +600,37 @@ mod tests {
         assert_eq!(slot.addr, tk::MACHO_BASE + 0x1000);
         assert_eq!(slot.library.as_deref(), Some("/usr/lib/libSystem.B.dylib"));
         assert_eq!(b.mitigations.pie, Some(true));
+    }
+
+    /// An executable laid out like `/bin/cat` on arm64e: `__TEXT` maps the first 16 KiB of the
+    /// file, and `__DATA` holds only zero-fill sections, so it has no file bytes and its file
+    /// offset is 0, the same as `__TEXT`'s.
+    fn executable_with_zero_fill_data(entryoff: u64) -> Vec<u8> {
+        let mut data = vec![0u8; 72];
+        data[0..4].copy_from_slice(&0x19u32.to_le_bytes());
+        data[4..8].copy_from_slice(&72u32.to_le_bytes());
+        data[8..14].copy_from_slice(b"__DATA");
+        data[24..32].copy_from_slice(&(tk::MACHO_BASE + 0x4000).to_le_bytes());
+        data[32..40].copy_from_slice(&0x4000u64.to_le_bytes());
+        data[56..60].copy_from_slice(&3u32.to_le_bytes());
+        data[60..64].copy_from_slice(&3u32.to_le_bytes());
+        let mut main = vec![0u8; 24];
+        main[0..4].copy_from_slice(&0x8000_0028u32.to_le_bytes());
+        main[4..8].copy_from_slice(&24u32.to_le_bytes());
+        main[8..16].copy_from_slice(&entryoff.to_le_bytes());
+        let mut m = tk::apple::macho_min(tk::apple::CPU_ARM64, 2, &[data, main], &[("__text", &[0; 4])]);
+        m.resize(0x4000, 0);
+        m
+    }
+
+    #[test]
+    fn the_entry_point_is_in_the_segment_that_holds_its_file_bytes() {
+        let b = crate::parse_binary(&executable_with_zero_fill_data(0x588)).unwrap();
+        let layout: Vec<_> = b.segments.iter().map(|s| (s.name.as_str(), s.file_offset, s.file_size)).collect();
+        assert_eq!(layout, [("__TEXT", 0, 0x4000), ("__DATA", 0, 0)]);
+        assert_eq!(b.entry, Some(tk::MACHO_BASE + 0x588));
+        // An offset past every segment's file bytes names no code.
+        assert_eq!(crate::parse_binary(&executable_with_zero_fill_data(0x5000)).unwrap().entry, None);
     }
 
     #[test]
@@ -783,5 +753,67 @@ mod tests {
         assert!(writable.sections.iter().all(|s| s.read && s.write));
         assert!(writable.sections[1].exec);
         assert!(!writable.sections[2].exec);
+    }
+}
+
+#[cfg(test)]
+mod shared_parity {
+    use super::*;
+    fn compare(data: &[u8]) {
+        match (legacy::fat_slices(data), fat_slices(data)) {
+            (Ok(a), Ok(b)) => assert_eq!(serde_json::to_value(a).unwrap(), serde_json::to_value(b).unwrap()),
+            (Err(a), Err(b)) => assert_eq!(a, b),
+            other => panic!("fat parity mismatch: {other:?}"),
+        }
+    }
+    #[test]
+    fn shared_fat_errors_bounds_and_serialization_match() {
+        for wide in [false, true] {
+            for count in [0u32, 1, 64, 65, u32::MAX] {
+                let mut data = vec![0; 4096];
+                data[..4].copy_from_slice(&if wide { 0xcafe_babfu32 } else { 0xcafe_babeu32 }.to_be_bytes());
+                data[4..8].copy_from_slice(&count.to_be_bytes());
+                compare(&data);
+                for len in 0..150 {
+                    compare(&data[..len]);
+                }
+                for pos in 0..100 {
+                    let old = data[pos];
+                    data[pos] = 255;
+                    compare(&data);
+                    data[pos] = old;
+                }
+            }
+        }
+    }
+    #[test]
+    fn shared_names_and_thread_states_match() {
+        for n in 0..512u32 {
+            for v in [n, n | 0x8000_0000, u32::MAX] {
+                assert_eq!(legacy::load_command_name(v), load_command_name(v));
+                assert_eq!(legacy::load_command_min_size(v), load_command_min_size(v));
+                assert_eq!(legacy::nibble_version(v), nibble_version(v));
+                for cpu in [7, 12, 0x0100_0007, 0x0100_000c, 0x0200_000c, 18, 0x0100_0012, v] {
+                    assert_eq!(legacy::cpu_name(cpu, v), cpu_name(cpu, v));
+                }
+            }
+        }
+        for (cpu, wide, flavor, count) in [(7, false, 1u32, 16u32), (0x0100_0007, true, 4, 42), (0x0100_000c, true, 6, 68)] {
+            let mut data = vec![0; 8 + count as usize * 4];
+            data[..4].copy_from_slice(&flavor.to_le_bytes());
+            data[4..8].copy_from_slice(&count.to_le_bytes());
+            data[8..].fill(31);
+            for len in 0..=data.len() {
+                assert_eq!(legacy::unixthread_pc(&data[..len], cpu, wide), unixthread_pc(&data[..len], cpu, wide));
+            }
+            for records in [4095, 4096] {
+                let mut prefixed = vec![0; records * 8];
+                prefixed.extend_from_slice(&data);
+                assert_eq!(legacy::unixthread_pc(&prefixed, cpu, wide), unixthread_pc(&prefixed, cpu, wide));
+                assert_eq!(unixthread_pc(&prefixed, cpu, wide).is_some(), records == 4095);
+            }
+            data[4..8].fill(255);
+            assert_eq!(legacy::unixthread_pc(&data, cpu, wide), unixthread_pc(&data, cpu, wide));
+        }
     }
 }

@@ -56,9 +56,13 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const DEFAULT_STDOUT_CAP: usize = 16 * 1024 * 1024;
 /// Default stderr cap.
 pub const DEFAULT_STDERR_CAP: usize = 1024 * 1024;
+/// How much of a stream's end is kept once it passes its cap, for a failure's message.
+const TAIL_KEEP: usize = 16 * 1024;
 /// How long to wait for the output threads after the child exits (an escaped grandchild may hold
 /// the pipe open; we stop waiting rather than hang).
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
+/// How long a program we stopped gets to be gone before we stop waiting for it.
+const REAP_GRACE: Duration = Duration::from_secs(5);
 /// Longest partial line kept before it is delivered anyway. MCP servers answer `tools/list` as
 /// one JSON-RPC line that can be megabytes (a plugin with many richly described tools), so this
 /// must cover such a whole line: a fragment is not JSON, and the answer would never parse.
@@ -100,6 +104,11 @@ pub struct Output {
     pub success: bool,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// The last bytes printed after `stdout` filled, when it was longer; empty otherwise. The
+    /// start stays in `stdout` for the tools that parse it, while errors show this end.
+    pub stdout_tail: Vec<u8>,
+    /// The last bytes printed after `stderr` filled, when it was longer; empty otherwise.
+    pub stderr_tail: Vec<u8>,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     pub duration: Duration,
@@ -112,6 +121,22 @@ impl Output {
 
     pub fn stderr_text(&self) -> String {
         String::from_utf8_lossy(&self.stderr).into_owned()
+    }
+
+    /// The end of stdout: the kept tail when more was printed than the cap, else all of it.
+    pub fn stdout_end_text(&self) -> String {
+        if self.stdout_tail.is_empty() { self.stdout_text() } else { String::from_utf8_lossy(&self.stdout_tail).into_owned() }
+    }
+
+    /// The end of stderr: the kept tail when more was printed than the cap, else all of it.
+    pub fn stderr_end_text(&self) -> String {
+        if self.stderr_tail.is_empty() { self.stderr_text() } else { String::from_utf8_lossy(&self.stderr_tail).into_owned() }
+    }
+
+    /// The end of the program's failure output: stderr, or stdout when stderr is blank.
+    pub fn end_text(&self) -> String {
+        let stderr_blank = self.stderr.iter().all(u8::is_ascii_whitespace) && self.stderr_tail.iter().all(u8::is_ascii_whitespace);
+        if stderr_blank { self.stdout_end_text() } else { self.stderr_end_text() }
     }
 }
 
@@ -361,19 +386,29 @@ impl Process {
     }
 }
 
+/// Programs start under its read side and [`crate::capture`] opens consoles and terminals under its
+/// write side: one being opened briefly has handles that a program started at that moment inherits
+/// (Windows Server 2022's console; a Unix terminal until it's made close-on-exec), and it then can't
+/// close until that program ends. Starts don't wait for each other, and nothing else is taken under it.
+pub(crate) static STARTING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 /// Start a program, trying again for about a third of a second while its file is busy. A program
 /// just written (an agent's update, a test's stand-in) can still be open for writing in a child
 /// another thread is starting, and Linux then refuses to run it ("Text file busy").
 fn spawn_retrying<T>(mut spawn: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut start = || {
+        let _starting = STARTING.read().unwrap_or_else(PoisonError::into_inner);
+        spawn()
+    };
     let mut wait = Duration::from_millis(5);
     for _ in 0..6 {
-        match spawn() {
+        match start() {
             Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => std::thread::sleep(wait),
             started => return started,
         }
         wait = wait.saturating_mul(2);
     }
-    spawn()
+    start()
 }
 
 /// The child gets [`search_path`](crate::which::search_path), which is also where a bare program
@@ -385,6 +420,9 @@ fn use_search_path(cmd: &mut std::process::Command) {
 }
 
 fn spawn_error(name: &str, program: &OsStr, cwd: Option<&std::path::Path>, e: std::io::Error, remediation: Option<&str>) -> ToolError {
+    if let Some(interpreter) = crate::which::shim_missing_interpreter(program) {
+        return interpreter_missing_error(name, program, &interpreter, &e);
+    }
     // Unix starts a relative path from the folder the child runs in; Windows from ours.
     let looked_up = if cfg!(unix) { started_from(program, cwd) } else { std::path::PathBuf::from(program) };
     let found = crate::which::which_in(&looked_up.to_string_lossy(), crate::which::search_path()).into_iter().next();
@@ -417,6 +455,17 @@ fn spawn_error_for(name: &str, program: &OsStr, e: std::io::Error, remediation: 
         .with_details(serde_json::json!({"program": program.to_string_lossy(), "reason": "found_but_not_started", "path": path.to_string_lossy()})),
         (kind, _) => spawn_error_kind(name, program, e, kind, remediation),
     }
+}
+
+/// An npm shim whose interpreter isn't anywhere we look. Rust then refuses to hand the `.cmd` an
+/// argument with a line break ("batch file arguments are invalid"), which says nothing about Node.
+/// It's a missing program, so builder turns aren't retried.
+fn interpreter_missing_error(name: &str, program: &OsStr, interpreter: &str, e: &std::io::Error) -> ToolError {
+    ToolError::new(ErrorCode::EngineMissing, format!("{name} was installed with npm and needs `{interpreter}` (Node.js) to run, but `{interpreter}` wasn't found."))
+        .with_remediation(format!(
+            "Install Node.js, or if you use nvm for Windows, run `nvm use <version>` in a terminal opened as administrator. Then restart Craft Anything. Installing {name} without npm also works, when it offers that."
+        ))
+        .with_details(serde_json::json!({"program": program.to_string_lossy(), "reason": "interpreter_missing", "interpreter": interpreter, "error": e.to_string()}))
 }
 
 fn spawn_error_kind(name: &str, program: &OsStr, e: std::io::Error, kind: std::io::ErrorKind, remediation: Option<&str>) -> ToolError {
@@ -490,19 +539,18 @@ fn shell_word(s: &str) -> String {
 pub fn output_excerpt(text: &str) -> String {
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let from = lines.len().saturating_sub(SHOWN_OUTPUT_LINES);
-    lines
-        .get(from..)
-        .unwrap_or_default()
-        .iter()
-        .map(|l| {
-            if l.chars().count() > SHOWN_OUTPUT_LINE_CHARS {
-                format!("{}…", l.chars().take(SHOWN_OUTPUT_LINE_CHARS).collect::<String>())
-            } else {
-                l.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    lines.get(from..).unwrap_or_default().iter().copied().map(clip_end).collect::<Vec<_>>().join("\n")
+}
+
+/// A line cut to a readable length at its end: the last part is what a failure says.
+fn clip_end(line: &str) -> String {
+    let n = line.chars().count();
+    if n > SHOWN_OUTPUT_LINE_CHARS {
+        let kept: String = line.chars().skip(n - SHOWN_OUTPUT_LINE_CHARS).collect();
+        format!("…{kept}")
+    } else {
+        line.to_string()
+    }
 }
 
 /// The line of a program's output that says what went wrong: the last one, or, when a crash ends
@@ -514,7 +562,7 @@ fn headline(text: &str) -> String {
         let frames_start = lines.get(..=last).unwrap_or_default().iter().rposition(|l| !is_stack_frame(l))?;
         lines.get(frames_start)
     });
-    above_trace.or(lines.last()).map(|l| l.to_string()).unwrap_or_default()
+    above_trace.or(lines.last()).map(|l| clip_end(l)).unwrap_or_default()
 }
 
 /// A stack frame: `at f (/app/chunk.js:96:6417)`, `at node:internal/main:28:49`,
@@ -525,6 +573,13 @@ fn is_stack_frame(line: &str) -> bool {
     at_line || (line.starts_with("... ") && line.ends_with(" more"))
 }
 
+/// The line that says what went wrong: from the end of a long output when it carries the error,
+/// else from the start (a crash's error sits above its stack trace, which can fill the end).
+fn headline_of(head: &str, end: &str) -> String {
+    let end_line = headline(end);
+    if end_line.is_empty() || is_stack_frame(&end_line) || end_line.starts_with("Node.js v") { headline(head) } else { end_line }
+}
+
 /// The error for a non-zero exit, with the last part of stderr (or stdout) for context.
 pub fn nonzero_error(name: &str, out: &Output) -> ToolError {
     nonzero_error_with(name, out, None)
@@ -533,13 +588,23 @@ pub fn nonzero_error(name: &str, out: &Output) -> ToolError {
 /// [`nonzero_error`], also saying what was run so the person can run it themselves.
 pub fn nonzero_error_with(name: &str, out: &Output, command: Option<&str>) -> ToolError {
     let code = out.code.map(|c| c.to_string()).unwrap_or_else(|| "a signal".into());
-    let stderr_tail = tail(&out.stderr, 2000);
-    let context = if stderr_tail.trim().is_empty() { tail(&out.stdout, 2000) } else { stderr_tail };
-    let first_line = headline(&String::from_utf8_lossy(if out.stderr.iter().all(u8::is_ascii_whitespace) { &out.stdout } else { &out.stderr }));
+    // The head is kept for parsers and a crash's first lines; the tail is how a long run ended.
+    let stderr_blank = out.stderr.iter().all(u8::is_ascii_whitespace) && out.stderr_tail.iter().all(u8::is_ascii_whitespace);
+    let (head, end, truncated) = if stderr_blank {
+        (String::from_utf8_lossy(&out.stdout), out.stdout_end_text(), out.stdout_truncated)
+    } else {
+        (String::from_utf8_lossy(&out.stderr), out.stderr_end_text(), out.stderr_truncated)
+    };
+    let end_shown = if end.trim().is_empty() && !head.trim().is_empty() { head.as_ref() } else { end.as_str() };
+    let context = tail(end_shown.as_bytes(), 2000);
+    let first_line = headline_of(head.as_ref(), &end);
     let msg =
         if first_line.is_empty() { format!("{name} stopped with exit code {code}.") } else { format!("{name} stopped with exit code {code}: {first_line}") };
     let excerpt = output_excerpt(&context);
     let mut said = if excerpt.is_empty() { format!("{name} printed nothing.") } else { format!("What {name} printed last:\n{excerpt}") };
+    if truncated {
+        said.push_str("\n\nThe output was cut; its last part is shown.");
+    }
     if let Some(command) = command {
         said.push_str(&format!("\n\nTo try it yourself, run:\n{command}"));
     }
@@ -649,22 +714,42 @@ impl Drop for RunningProcess {
 
 struct Capped {
     data: Vec<u8>,
+    /// The last bytes after `data` filled, so a failure can show how the program ended.
+    tail: std::collections::VecDeque<u8>,
     cap: usize,
+    tail_cap: usize,
     truncated: bool,
 }
 
 impl Capped {
     fn new(cap: usize) -> Self {
-        Capped { data: Vec::new(), cap, truncated: false }
+        Capped { data: Vec::new(), tail: std::collections::VecDeque::new(), cap, tail_cap: TAIL_KEEP.min(cap), truncated: false }
     }
 
     fn push(&mut self, bytes: &[u8]) {
         let room = self.cap.saturating_sub(self.data.len());
-        if bytes.len() > room {
-            self.truncated = true;
+        if bytes.len() <= room {
+            self.data.extend_from_slice(bytes);
+            return;
         }
-        if let Some(part) = bytes.get(..room.min(bytes.len())) {
+        self.truncated = true;
+        if let Some(part) = bytes.get(..room) {
             self.data.extend_from_slice(part);
+        }
+        let rest = bytes.get(room..).unwrap_or_default();
+        // Keep the last `tail_cap` bytes of everything past the head.
+        if rest.len() >= self.tail_cap {
+            self.tail.clear();
+            let from = rest.len().saturating_sub(self.tail_cap);
+            if let Some(part) = rest.get(from..) {
+                self.tail.extend(part.iter().copied());
+            }
+        } else {
+            let over = self.tail.len().saturating_add(rest.len()).saturating_sub(self.tail_cap);
+            for _ in 0..over.min(self.tail.len()) {
+                self.tail.pop_front();
+            }
+            self.tail.extend(rest.iter().copied());
         }
     }
 }
@@ -753,20 +838,29 @@ enum Stop {
 impl Supervisor {
     fn run(mut self) -> Result<Output, ToolError> {
         let stop = self.watch();
-        if !matches!(stop, Stop::Exited(_)) {
-            let _ = self.child.start_kill();
-            let _ = self.child.kill();
-        } else {
-            // The leader exited; take any leftover group members with it so they can't hold the pipes.
-            let _ = self.child.kill();
-        }
+        // Stopped, or the leader exited: take any leftover group members with it so they can't
+        // hold the pipes.
+        end(self.child.as_mut(), &self.name);
         self.drain();
         let duration = self.start.elapsed();
-        let (stdout, stdout_truncated) = take(&self.out_buf);
-        let (stderr, stderr_truncated) = take(&self.err_buf);
-        let partial = || serde_json::json!({"stdout_tail": tail(&stdout, 2000), "stderr_tail": tail(&stderr, 2000)});
+        let (stdout, stdout_tail, stdout_truncated) = take(&self.out_buf);
+        let (stderr, stderr_tail, stderr_truncated) = take(&self.err_buf);
+        let partial = || {
+            let end = |head: &[u8], end_bytes: &[u8]| if end_bytes.is_empty() { tail(head, 2000) } else { tail(end_bytes, 2000) };
+            serde_json::json!({"stdout_tail": end(&stdout, &stdout_tail), "stderr_tail": end(&stderr, &stderr_tail)})
+        };
         match stop {
-            Stop::Exited(status) => Ok(Output { code: status.code(), success: status.success(), stdout, stderr, stdout_truncated, stderr_truncated, duration }),
+            Stop::Exited(status) => Ok(Output {
+                code: status.code(),
+                success: status.success(),
+                stdout,
+                stderr,
+                stdout_tail,
+                stderr_tail,
+                stdout_truncated,
+                stderr_truncated,
+                duration,
+            }),
             Stop::Wall => Err(ToolError::new(ErrorCode::TimedOut, format!("{} took longer than {} s and was stopped.", self.name, self.wall.as_secs()))
                 .with_remediation("Try a smaller job, or raise the time limit in Settings.")
                 .with_details(serde_json::json!({"deadline": "wall", "timeout_ms": self.wall.as_millis() as u64, "partial": partial()}))),
@@ -795,6 +889,13 @@ impl Supervisor {
                 }
             }
             if self.kill.load(Ordering::SeqCst) || self.cancel.as_ref().is_some_and(|c| c()) {
+                // A program that exited since the check above ended on its own (a launcher that
+                // handed off, or a run that finished): say how, not that it was stopped.
+                if handed_off.is_none()
+                    && let Ok(Some(status)) = self.child.try_wait()
+                {
+                    return Stop::Exited(status);
+                }
                 return handed_off.map_or(Stop::Cancelled, Stop::Exited);
             }
             let elapsed = self.start.elapsed();
@@ -827,9 +928,33 @@ impl Supervisor {
     }
 }
 
-fn take(buf: &Arc<Mutex<Capped>>) -> (Vec<u8>, bool) {
+/// Stop a program and whatever it started, waiting only [`REAP_GRACE`] for it to be gone. The
+/// library's own `kill()` waits with no limit: for the process, which can outlive its stop for
+/// as long as a driver holds one of its threads, and on Windows then for a job message the
+/// system doesn't promise to send. That was the one step of a run that neither its time limit
+/// nor a cancel could reach (#1438).
+fn end(child: &mut dyn ChildWrapper, name: &str) {
+    let _ = child.start_kill();
+    let deadline = Instant::now() + REAP_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                log::warn!("{name}: still there {} s after it was stopped; not waiting for it", REAP_GRACE.as_secs());
+                return;
+            }
+            Err(e) => {
+                log::warn!("{name}: couldn't tell whether it ended after it was stopped: {e}");
+                return;
+            }
+        }
+    }
+}
+
+fn take(buf: &Arc<Mutex<Capped>>) -> (Vec<u8>, Vec<u8>, bool) {
     let mut g = buf.lock().unwrap_or_else(PoisonError::into_inner);
-    (std::mem::take(&mut g.data), g.truncated)
+    (std::mem::take(&mut g.data), g.tail.drain(..).collect(), g.truncated)
 }
 
 /// A program started in its own window that is meant to outlive us: a finished game, an
@@ -892,6 +1017,11 @@ impl Launch {
     /// Write what the program prints (output and errors) to this file, replacing it. A file, not
     /// a pipe: the program keeps running after we exit, and writing to a pipe nobody reads would
     /// fail (or stop it).
+    ///
+    /// The file is opened for the program to append to, and while we are alive it is cut back to
+    /// empty once it passes [`LOG_CAP`](crate::process::LOG_CAP), so a program that prints
+    /// forever cannot fill the disk. Nothing breaks when it is cut: the program's next write lands
+    /// at the new end. Once we have exited the cut stops, and the file grows as it always did.
     pub fn log_to(mut self, file: impl Into<PathBuf>) -> Self {
         self.log = Some(file.into());
         self
@@ -932,7 +1062,7 @@ impl Launch {
         use_search_path(&mut cmd);
         match &self.log {
             Some(path) => {
-                let out = std::fs::File::create(path).map_err(|e| ToolError::io(path.display(), e))?;
+                let out = open_log(path).map_err(|e| ToolError::io(path.display(), e))?;
                 let err = out.try_clone().map_err(|e| ToolError::io(path.display(), e))?;
                 cmd.stdout(out).stderr(err);
             }
@@ -949,13 +1079,33 @@ impl Launch {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
-        let child = spawn_retrying(|| cmd.spawn()).map_err(|e| spawn_error(&name, &self.program, self.cwd.as_deref(), e, self.remediation.as_deref()))?;
+        let mut wrap = process_wrap::std::CommandWrap::from(cmd);
+        #[cfg(unix)]
+        wrap.wrap(process_wrap::std::ProcessGroup::leader());
+        #[cfg(windows)]
+        {
+            wrap.wrap(process_wrap::std::JobObject);
+            if self.hide_console {
+                wrap.wrap(process_wrap::std::CreationFlags(windows::Win32::System::Threading::CREATE_NO_WINDOW));
+            }
+        }
+        let child = spawn_retrying(|| wrap.spawn()).map_err(|e| spawn_error(&name, &self.program, self.cwd.as_deref(), e, self.remediation.as_deref()))?;
         let launched = Launched { pid: child.id(), started: Instant::now(), state: Arc::new(Mutex::new(LaunchState { child: Some(child), ended: None })) };
         // Reap it when it closes. If no thread can be made the child still runs (and `ended`
         // stays unknown); on Unix it stays a zombie until we exit, which is harmless.
         let watched = launched.clone();
+        let log = self.log.clone();
         let _ = std::thread::Builder::new().name(format!("launched-{name}")).spawn(move || {
+            let mut next_cut = Instant::now() + LOG_CUT_EVERY;
             while watched.poll().is_none() {
+                // Keep the log bounded while the program runs; the watch ends with it, so a program
+                // that outlives us is left exactly as it was before.
+                if let Some(path) = &log
+                    && Instant::now() >= next_cut
+                {
+                    cut_log(path);
+                    next_cut = Instant::now() + LOG_CUT_EVERY;
+                }
                 std::thread::sleep(LAUNCH_POLL);
             }
             if let Some(Ended { code: Some(c), .. }) = watched.ended()
@@ -971,6 +1121,41 @@ impl Launch {
 /// How often a launched program is checked for having ended.
 const LAUNCH_POLL: Duration = Duration::from_millis(250);
 
+/// How big a launched program's log may get while we are alive: past this it is cut back to empty.
+/// A run's log is read for its last lines (a build's warnings, a game's crash), so keeping the tail
+/// is what matters and a cap this size holds many screens of it.
+pub const LOG_CAP: u64 = 1024 * 1024;
+
+/// How often the log is measured against [`LOG_CAP`].
+const LOG_CUT_EVERY: Duration = Duration::from_secs(2);
+
+/// Open a launched program's log for it to write to: appended, never truncated by its own writes,
+/// so a cut made from our side leaves nothing for it to trip over.
+fn open_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    // Windows refuses one open that both truncates and appends, so replace the file and then hand
+    // the program a handle that only appends.
+    std::fs::File::create(path)?;
+    std::fs::OpenOptions::new().append(true).open(path)
+}
+
+/// Cut a log back to empty once it has passed [`LOG_CAP`]. The program holding it open appends, so
+/// its next write lands at the new end; if the file can't be cut (someone else holds it), it is
+/// simply left alone until the next look.
+fn cut_log(path: &std::path::Path) {
+    let Ok(size) = std::fs::metadata(path).map(|m| m.len()) else { return };
+    if size <= LOG_CAP {
+        return;
+    }
+    match open_log_for_cut(path) {
+        Ok(()) => log::info!("cut {} at {size} bytes", path.display()),
+        Err(e) => log::warn!("could not cut {} at {size} bytes: {e}", path.display()),
+    }
+
+    fn open_log_for_cut(path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::OpenOptions::new().write(true).open(path)?.set_len(0)
+    }
+}
+
 /// A program started with [`Launch::start_watched`]. Clones share the same program.
 #[derive(Debug, Clone)]
 pub struct Launched {
@@ -981,7 +1166,7 @@ pub struct Launched {
 
 #[derive(Debug)]
 struct LaunchState {
-    child: Option<std::process::Child>,
+    child: Option<Box<dyn process_wrap::std::ChildWrapper>>,
     ended: Option<Ended>,
 }
 
@@ -1049,22 +1234,24 @@ impl Launched {
     }
 
     /// Stop it (the program itself; what it started on its own may stay). Returns once it has
-    /// ended, or false if it couldn't be stopped.
+    /// ended, or false if it couldn't be stopped or is still there [`REAP_GRACE`] later. The
+    /// library's `kill()` waits with no limit (#1438), and waiting under the lock would hold up
+    /// the watcher and everyone asking whether it runs.
     pub fn stop(&self) -> bool {
-        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if st.ended.is_some() {
-            return true;
-        }
-        let Some(child) = st.child.as_mut() else { return false };
-        let _ = child.kill();
-        match child.wait() {
-            Ok(status) => {
-                st.ended = Some(Ended { code: status.code(), after: self.started.elapsed() });
-                st.child = None;
-                true
+        {
+            let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if st.ended.is_some() {
+                return true;
             }
-            Err(_) => false,
+            let Some(child) = st.child.as_mut() else { return false };
+            // A program that just ended refuses the kill: the wait below says how it ended.
+            let _ = child.start_kill();
         }
+        let ended = self.wait_timeout(REAP_GRACE).is_some();
+        if !ended {
+            log::warn!("program {}: still there {} s after it was stopped; not waiting for it", self.pid, REAP_GRACE.as_secs());
+        }
+        ended
     }
 }
 
@@ -1242,6 +1429,73 @@ mod launch_tests {
         assert!(text.contains("out-line") && text.contains("err-line"), "{text}");
     }
 
+    /// A program that prints far more than the cap keeps running to the end, and its log is cut
+    /// while it writes: the cut is ours, not something its own writes run into.
+    #[test]
+    fn a_launched_programs_log_is_cut_back_while_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run.log");
+        std::fs::write(dir.path().join("log-path"), log.display().to_string()).unwrap();
+        std::fs::write(dir.path().join("log-writer"), b"go").unwrap();
+        let l = Launch::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "process::launch_tests::log_writer_stand_in"])
+            .cwd(dir.path())
+            .hide_console()
+            .log_to(&log)
+            .start_watched()
+            .unwrap();
+        let ended = l.wait_timeout(Duration::from_secs(120)).expect("the writer ended");
+        assert_eq!(ended.code, Some(0), "a cut never breaks the program's own writes");
+        let report = std::fs::read_to_string(dir.path().join("wrote")).unwrap();
+        let (wrote, cuts): (u64, u32) = {
+            let mut parts = report.split_whitespace();
+            (parts.next().unwrap().parse().unwrap(), parts.next().unwrap().parse().unwrap())
+        };
+        assert!(wrote > LOG_CAP, "the stand-in printed more than the cap: {wrote}");
+        // The stand-in waits for a cut and writes on past it, so this doesn't depend on how fast
+        // the cuts come: it printed more than the cap, saw the file shrink, and its later writes
+        // were accepted.
+        assert!(cuts >= 1, "the log was cut while the program ran: {report}");
+        let kept = std::fs::metadata(&log).unwrap().len();
+        assert!(kept <= 2 * LOG_CAP, "the log stayed small after {wrote} bytes: {kept}");
+    }
+
+    /// Prints past the cap in chunks, waits to see its own log shrink, writes on to show the cut
+    /// left its writes alone, then says how much it printed and how many cuts it saw. Only runs
+    /// when the test above leaves its guard files in the working directory.
+    #[test]
+    #[ignore = "stand-in invoked by a_launched_programs_log_is_cut_back_while_it_runs"]
+    fn log_writer_stand_in() {
+        use std::io::Write;
+        if std::fs::read("log-writer").is_err() {
+            return;
+        }
+        let log = std::fs::read_to_string("log-path").unwrap().trim().to_string();
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut out = std::io::stdout();
+        let (mut wrote, mut cuts, mut last) = (0u64, 0u32, 0u64);
+        // Enough chunks for a loaded machine: a cut comes every couple of seconds, and this goes on
+        // until it has seen one and written past it.
+        for _ in 0..4096 {
+            out.write_all(&chunk).unwrap();
+            out.write_all(b"\n").unwrap();
+            out.flush().unwrap();
+            wrote += chunk.len() as u64 + 1;
+            let kept = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+            if kept < last {
+                cuts += 1;
+            }
+            last = kept;
+            // A cut has been seen and the writes after it have filled the file again, which is the
+            // thing worth proving: the cut doesn't get in the program's way.
+            if cuts > 0 && kept > LOG_CAP / 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::write("wrote", format!("{wrote} {cuts}")).unwrap();
+    }
+
     #[test]
     fn a_watched_program_can_be_stopped() {
         let script = if cfg!(windows) { "ping -n 30 127.0.0.1 > NUL" } else { "sleep 30" };
@@ -1253,6 +1507,156 @@ mod launch_tests {
         assert!(l.ended().unwrap().after < Duration::from_secs(20));
     }
 
+    /// Verify that stopping a watched launch stops its descendant on Unix and Windows.
+    ///
+    /// Wait for the child's startup and heartbeat files, then stop even if they are absent. The
+    /// descendant holds an exclusive lock on `descendant-alive` for its whole life, and the system
+    /// releases it only when the process exits: taking that lock after `stop()` is the exit probe,
+    /// with no timing guess. A descendant that outlived the stop instead finishes its bounded loop
+    /// and writes `descendant-survived` before its lock is released.
+    #[test]
+    fn stopping_a_watched_program_stops_its_descendant() {
+        let dir = tempfile::Builder::new().prefix("watched descendant ").tempdir().unwrap();
+        let l = start_descendant_fixture(dir.path(), true);
+        let (started, heartbeat) = stop_after_descendant_startup(&l, dir.path(), Duration::from_secs(5));
+        assert!(started, "descendant never signalled that it started");
+        assert!(heartbeat, "descendant never produced a heartbeat");
+        // Exclusive locks may need write access (e.g. on NFS), so open for reading and writing.
+        let alive = std::fs::OpenOptions::new().read(true).write(true).open(dir.path().join("descendant-alive")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            match alive.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => panic!("descendant still holds its lock after the watched program stopped: {e}"),
+            }
+        }
+        assert!(!dir.path().join("descendant-survived").exists(), "descendant ran to completion after the watched program stopped");
+    }
+
+    /// Wait for bounded startup, snapshot its markers, and stop before callers assert on them.
+    fn stop_after_descendant_startup(launch: &Launched, dir: &std::path::Path, timeout: Duration) -> (bool, bool) {
+        let started = dir.join("descendant-started");
+        let heartbeat = dir.join("descendant-heartbeat");
+        let deadline = Instant::now() + timeout;
+        while (!started.exists() || !heartbeat.exists()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let markers = (started.exists(), heartbeat.exists());
+        assert!(launch.stop(), "could not stop the watched launch");
+        markers
+    }
+
+    /// Missing startup markers must still stop a live fixture before reporting startup failure.
+    ///
+    /// Wait (bounded) for the parent to say it is waiting, so the stop is proven to end a live
+    /// process; stop before asserting, then require that it never finished on its own.
+    #[test]
+    fn a_descendant_startup_timeout_stops_the_watched_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = start_descendant_fixture(dir.path(), false);
+        let ready = dir.path().join("parent-waiting");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !ready.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let parent_ready = ready.exists();
+        let markers = stop_after_descendant_startup(&l, dir.path(), Duration::from_millis(100));
+        assert!(parent_ready, "the waiting parent never signalled that it was ready");
+        assert_eq!(markers, (false, false));
+        assert!(!l.is_running(), "startup failure left the watched launch running");
+        assert!(!dir.path().join("parent-completed").exists(), "the waiting parent finished on its own instead of being stopped");
+    }
+
+    /// Enable the guarded parent in an isolated directory, with or without child startup.
+    fn start_descendant_fixture(dir: &std::path::Path, start_descendant: bool) -> Launched {
+        std::fs::write(dir.join("descendant-fixture"), if start_descendant { "start" } else { "wait" }).unwrap();
+        Launch::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "process::launch_tests::watched_parent_stand_in"])
+            .cwd(dir)
+            .hide_console()
+            .start_watched()
+            .unwrap()
+    }
+
+    /// Start the bounded child in the watched parent's process group and wait for it.
+    ///
+    /// An exact directory-local guard enables this fixture. The `wait` mode simulates a
+    /// parent that stays alive without starting its child, exercising timeout cleanup: it
+    /// writes `parent-waiting` once running and `parent-completed` only if its wait runs out.
+    #[test]
+    #[ignore = "stand-in invoked by watched descendant tests"]
+    fn watched_parent_stand_in() {
+        match std::fs::read("descendant-fixture").ok().as_deref() {
+            Some(b"start") => {}
+            Some(b"wait") => {
+                std::fs::write("parent-waiting", b"ready").unwrap();
+                std::thread::sleep(Duration::from_secs(5));
+                std::fs::write("parent-completed", b"yes").unwrap();
+                return;
+            }
+            _ => return,
+        }
+        // This process-layer fixture must inherit the parent's group/job. Process and
+        // Launch deliberately create new Unix groups, which would invalidate the test.
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--ignored", "--exact", "process::launch_tests::watched_descendant_stand_in"])
+            .env("CRAFT_ANYTHING_TEST_DESCENDANT", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        // The child's heartbeat loop exits after five seconds even if no stop arrives.
+        let mut child = spawn_retrying(|| command.spawn()).unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    /// Provide a child process whose marker files expose whether it survives shutdown.
+    ///
+    /// Return without writing unless `CRAFT_ANYTHING_TEST_DESCENDANT` is exactly `1`, as
+    /// set by the parent test. When enabled, hold an exclusive lock on `descendant-alive` until
+    /// the process exits, write startup and periodic heartbeat files in the working directory,
+    /// then a survival marker (before the lock is released) if the loop reaches its end.
+    #[test]
+    #[ignore = "stand-in invoked by stopping_a_watched_program_stops_its_descendant"]
+    fn watched_descendant_stand_in() {
+        if std::env::var_os("CRAFT_ANYTHING_TEST_DESCENDANT").as_deref() != Some(OsStr::new("1")) {
+            return;
+        }
+        let alive = std::fs::File::create("descendant-alive").unwrap();
+        alive.lock().unwrap();
+        std::fs::write("descendant-started", b"ready").unwrap();
+        for n in 0..100 {
+            std::fs::write("descendant-heartbeat", n.to_string()).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::fs::write("descendant-survived", b"yes").unwrap();
+    }
+
+    /// Verify that directly running the ignored fixture without its guard writes no files.
+    ///
+    /// Start the test executable in an empty temporary directory with the guard removed,
+    /// then require a successful exit and an unchanged directory.
+    #[test]
+    fn a_direct_descendant_stand_in_run_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        for fixture in ["watched_parent_stand_in", "watched_descendant_stand_in"] {
+            let out = Process::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", &format!("process::launch_tests::{fixture}")])
+                .env_remove("CRAFT_ANYTHING_TEST_DESCENDANT")
+                .cwd(dir.path())
+                .run()
+                .unwrap();
+            assert!(out.success, "{fixture}: {}", out.stderr_text());
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "the unguarded {fixture} wrote files");
+        }
+    }
+
     fn exits_with(code: u8) -> Process {
         let code = format!("exit {code}");
         if cfg!(windows) { Process::new("cmd").args(["/C", &code]) } else { Process::new("sh").args(["-c", &code]) }
@@ -1262,8 +1666,23 @@ mod launch_tests {
     fn a_launcher_that_hands_off_keeps_its_group_until_stopped() {
         // Plain: a clean exit ends the run.
         assert!(exits_with(0).run().unwrap().success);
-        // Handing off: the launcher's clean exit doesn't, so the browser it started lives on.
-        let mut p = exits_with(0).hands_off().spawn().unwrap();
+        // Handing off: the launcher's clean exit doesn't, so the browser it started lives on. The
+        // launcher leaves a mark as its last step and the kill waits for it: on a busy machine
+        // `cmd` could still be starting when a fixed 500 ms was up, and a launcher stopped before
+        // it handed off is a cancelled run, not a clean one.
+        let dir = tempfile::tempdir().unwrap();
+        let mark = dir.path().join("handed-off");
+        let launcher = if cfg!(windows) {
+            Process::new("cmd").args(["/C", "type nul > handed-off & exit 0"])
+        } else {
+            Process::new("sh").args(["-c", ": > handed-off; exit 0"])
+        };
+        let mut p = launcher.cwd(dir.path()).hands_off().spawn().unwrap();
+        let start = std::time::Instant::now();
+        while !mark.exists() && start.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(mark.exists(), "the launcher never ran");
         assert!(p.wait_timeout(Duration::from_millis(500)).is_none(), "a clean hand-off ended the run");
         assert!(p.kill_and_wait(Duration::from_secs(5)));
         assert!(p.wait().unwrap().success);
@@ -1300,6 +1719,61 @@ mod launch_tests {
 #[cfg(test)]
 mod error_tests {
     use super::*;
+
+    /// A program that is still there after it was stopped, and whose `wait` never returns.
+    #[derive(Debug)]
+    struct Undying {
+        stopped: bool,
+    }
+
+    impl ChildWrapper for Undying {
+        fn inner(&self) -> &dyn ChildWrapper {
+            self
+        }
+        fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+            self
+        }
+        fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+            self
+        }
+        fn start_kill(&mut self) -> std::io::Result<()> {
+            self.stopped = true;
+            Ok(())
+        }
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            Ok(None)
+        }
+        fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        }
+    }
+
+    /// #1438: a check sat for hours with Pause dead. Stopping a program waited for it with no
+    /// limit, so one that outlived its stop held the run past every deadline.
+    #[test]
+    fn a_program_that_outlives_its_stop_is_not_waited_for() {
+        let mut child = Undying { stopped: false };
+        let started = Instant::now();
+        end(&mut child, "the program");
+        assert!(child.stopped, "it is still told to stop");
+        let took = started.elapsed();
+        assert!(took >= REAP_GRACE && took < REAP_GRACE + Duration::from_secs(5), "{took:?}");
+    }
+
+    /// An npm shim whose Node is missing is a missing program, named, with what to do about it.
+    #[test]
+    fn a_shim_without_its_interpreter_says_so() {
+        let e = std::io::Error::new(std::io::ErrorKind::InvalidInput, "batch file arguments are invalid");
+        let err = interpreter_missing_error("Claude Code", OsStr::new("claude"), "node", &e);
+        assert_eq!(err.code, ErrorCode::EngineMissing);
+        assert!(err.message.contains("needs `node`") && !err.message.contains("batch file"), "{}", err.message);
+        assert!(err.remediation.as_deref().is_some_and(|r| r.contains("nvm use")), "{:?}", err.remediation);
+        let details = err.details.unwrap();
+        assert_eq!((details["reason"].as_str(), details["interpreter"].as_str()), (Some("interpreter_missing"), Some("node")));
+        assert_eq!(details["error"].as_str(), Some("batch file arguments are invalid"));
+    }
 
     /// A busy program file is tried again; any other error, or a file that stays busy, is returned.
     #[test]
@@ -1345,11 +1819,37 @@ mod error_tests {
             success: false,
             stdout: Vec::new(),
             stderr: bun.into(),
+            stdout_tail: Vec::new(),
+            stderr_tail: Vec::new(),
             stdout_truncated: false,
             stderr_truncated: false,
             duration: Duration::ZERO,
         };
         assert_eq!(nonzero_error("OpenCode", &out).message, "OpenCode stopped with exit code 1: error: No provider is set up");
+    }
+
+    /// A failure whose last line is longer than the excerpt's line limit shows the line's end,
+    /// where the error is, not its start.
+    #[test]
+    fn a_long_last_line_shows_its_end() {
+        let line = format!("{}REAL-ERROR", "w".repeat(1000));
+        let shown = output_excerpt(&line);
+        assert!(shown.starts_with('…') && shown.contains("REAL-ERROR"), "{shown}");
+        assert_eq!(shown.chars().count(), SHOWN_OUTPUT_LINE_CHARS + 1);
+    }
+
+    /// The failure's text is stderr, or stdout when stderr is blank, and its kept end when the
+    /// stream was longer than its cap.
+    #[test]
+    fn end_text_uses_stderr_or_stdout_and_the_tail() {
+        let stderr = Output { stderr: b"warn\n".to_vec(), ..Default::default() };
+        assert_eq!(stderr.end_text(), "warn\n");
+        let stdout = Output { stdout: b"out\n".to_vec(), ..Default::default() };
+        assert_eq!(stdout.end_text(), "out\n");
+        let tail = Output { stderr: b"head".to_vec(), stderr_tail: b"REAL".to_vec(), ..Default::default() };
+        assert_eq!(tail.end_text(), "REAL");
+        let blank = Output { stderr: b"  ".to_vec(), stderr_tail: b"REAL".to_vec(), ..Default::default() };
+        assert_eq!(blank.end_text(), "REAL", "a blank head doesn't hide the tail");
     }
 
     /// #721: a saved path to a program that an update moved said "isn't installed or isn't on your
@@ -1517,6 +2017,60 @@ mod tests {
         assert!(out.success);
         assert_eq!(out.stdout.len(), 1024);
         assert!(out.stdout_truncated);
+    }
+
+    /// A failed program that prints far more to stderr than the cap keeps its real, last error:
+    /// the message names it and the excerpt shows the end, with the cut said out loud.
+    #[test]
+    fn a_long_failure_keeps_its_last_output() {
+        let out = Process::new("sh").args(["-c", "head -c 4194304 /dev/zero | tr '\\0' w >&2; echo REAL-ERROR >&2; exit 1"]).stderr_cap(4096).run().unwrap();
+        assert!(!out.success && out.stderr_truncated);
+        assert_eq!(out.stderr.len(), 4096);
+        let err = nonzero_error("sh", &out);
+        assert!(err.message.contains("REAL-ERROR"), "the real error is named: {:.200}", err.message);
+        assert!(out.stderr_end_text().contains("REAL-ERROR"), "the end is kept: {}", out.stderr_end_text());
+        let help = err.remediation.unwrap_or_default();
+        assert!(help.contains("REAL-ERROR"), "the excerpt shows the end: {help}");
+        assert!(help.contains("cut"), "the error says the output was cut: {help}");
+    }
+
+    /// The same when the program writes its failure to stdout: the kept end is used.
+    #[test]
+    fn a_long_stdout_failure_keeps_its_last_output() {
+        let out = Process::new("sh").args(["-c", "head -c 4194304 /dev/zero | tr '\\0' w; echo REAL-ERROR; exit 1"]).stdout_cap(4096).run().unwrap();
+        assert!(!out.success && out.stdout_truncated);
+        assert_eq!(out.stdout.len(), 4096);
+        assert!(out.stdout_end_text().contains("REAL-ERROR"), "the end is kept: {}", out.stdout_end_text());
+        let err = nonzero_error("sh", &out);
+        assert!(err.message.contains("REAL-ERROR"), "the real error is named: {:.200}", err.message);
+        assert!(err.remediation.unwrap_or_default().contains("REAL-ERROR"), "the excerpt shows the end");
+    }
+
+    /// A truncated crash still gets its error line from the start: the end is only a stack trace,
+    /// which must not become the headline.
+    #[test]
+    fn a_truncated_crash_is_named_by_its_error_not_its_last_frame() {
+        let mut head = String::from("Error: Not signed in\n");
+        for i in 0..200 {
+            head.push_str(&format!("    at step{i} (/app/cli.js:{i}:1)\n"));
+        }
+        let mut tail = String::new();
+        for i in 200..400 {
+            tail.push_str(&format!("    at step{i} (/app/cli.js:{i}:1)\n"));
+        }
+        tail.push_str("\nNode.js v20.11.0\n");
+        let out = Output {
+            code: Some(1),
+            success: false,
+            stdout: Vec::new(),
+            stderr: head.into_bytes(),
+            stdout_tail: Vec::new(),
+            stderr_tail: tail.into_bytes(),
+            stdout_truncated: false,
+            stderr_truncated: true,
+            duration: Duration::ZERO,
+        };
+        assert!(nonzero_error("OpenCode", &out).message.contains("Not signed in"), "{}", nonzero_error("OpenCode", &out).message);
     }
 
     #[test]

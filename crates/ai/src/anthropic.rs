@@ -8,6 +8,14 @@ use serde_json::{Value, json};
 
 pub const DEFAULT_BASE: &str = "https://api.anthropic.com";
 pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
+
+/// Whether an address is Anthropic's own API, which speaks this protocol and not OpenAI's (#1100).
+pub fn is_anthropic_api(address: &str) -> bool {
+    crate::openai::https_host_path(address).is_some_and(|(host, _)| host.eq_ignore_ascii_case("api.anthropic.com"))
+}
+/// A picker choice meaning "don't pass `--model`": Claude Code uses the model its own settings
+/// name, which a person may have customised (a custom model, an alias, `opusplan`…). Not a model id.
+pub const CLAUDE_CODE_DEFAULT: &str = "default";
 /// Offered in the model dropdown when the live list can't be fetched.
 pub const MODELS: &[&str] = &["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"];
 /// Models that offer fewer effort levels than all five (Claude's effort guide), by model id
@@ -26,6 +34,9 @@ pub fn effort_for(model: &str, effort: Effort) -> Effort {
 }
 pub const API_VERSION: &str = "2023-06-01";
 pub const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+/// Lets a request say what happens to a thinking block whose conversation changed since it was
+/// written (`thinking.block_binding`).
+pub const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 pub const MAX_TOKENS: u32 = 64_000;
 
 /// Most content blocks we track in one response.
@@ -38,6 +49,8 @@ pub struct Anthropic {
     pub model: String,
     /// Send the server-side fallback header and body field.
     pub fallbacks: bool,
+    /// The AI's own limit on one streamed answer; none uses the defaults.
+    pub stream_limit: Option<std::time::Duration>,
 }
 
 impl Anthropic {
@@ -47,6 +60,7 @@ impl Anthropic {
             api_key,
             model: if model.is_empty() { DEFAULT_MODEL.to_string() } else { model.to_string() },
             fallbacks: true,
+            stream_limit: None,
         }
     }
 
@@ -56,11 +70,8 @@ impl Anthropic {
     }
 
     pub fn headers(&self) -> Vec<(&'static str, String)> {
-        let mut h = vec![("x-api-key", self.api_key.clone()), ("anthropic-version", API_VERSION.to_string())];
-        if self.fallbacks {
-            h.push(("anthropic-beta", FALLBACK_BETA.to_string()));
-        }
-        h
+        let betas = if self.fallbacks { format!("{THINKING_BINDING_BETA},{FALLBACK_BETA}") } else { THINKING_BINDING_BETA.to_string() };
+        vec![("x-api-key", self.api_key.clone()), ("anthropic-version", API_VERSION.to_string()), ("anthropic-beta", betas)]
     }
 
     /// The request body for one streamed turn.
@@ -71,7 +82,10 @@ impl Anthropic {
             "stream": true,
             "system": [{"type": "text", "text": req.system, "cache_control": {"type": "ephemeral"}}],
             "messages": req.messages.iter().map(message_json).collect::<Vec<_>>(),
-            "thinking": {"type": "adaptive", "display": "summarized"},
+            // Summarising or trimming earlier turns, or a resumed build's new system prompt, changes
+            // what an earlier thinking block was written after; the API then drops that block
+            // and the ones after it instead of refusing the whole request (#1585).
+            "thinking": {"type": "adaptive", "display": "summarized", "block_binding": {"prefix_mismatch_behavior": "drop_block"}},
             "output_config": {"effort": effort_for(&self.model, req.effort).as_str()},
         });
         if !req.tools.is_empty() {
@@ -122,14 +136,17 @@ pub fn message_json(m: &Msg) -> Value {
     let content: Vec<Value> = m
         .blocks
         .iter()
-        .map(|b| match b {
-            Block::Text { text } => json!({"type": "text", "text": text}),
-            Block::Thinking { thinking, signature } => json!({"type": "thinking", "thinking": thinking, "signature": signature}),
-            Block::RedactedThinking { data } => json!({"type": "redacted_thinking", "data": data}),
-            Block::ToolUse { id, name, input } => json!({"type": "tool_use", "id": id, "name": name, "input": input}),
-            Block::ToolResult { tool_use_id, content, is_error } => {
-                json!({"type": "tool_result", "tool_use_id": tool_use_id, "content": content, "is_error": is_error})
-            }
+        .filter_map(|b| {
+            Some(match b {
+                Block::Text { text } => json!({"type": "text", "text": text}),
+                Block::Thinking { thinking, signature } => json!({"type": "thinking", "thinking": thinking, "signature": signature}),
+                Block::RedactedThinking { data } => json!({"type": "redacted_thinking", "data": data}),
+                Block::ToolUse { id, name, input } => json!({"type": "tool_use", "id": id, "name": name, "input": input}),
+                Block::ToolExtra { .. } => return None,
+                Block::ToolResult { tool_use_id, content, is_error } => {
+                    json!({"type": "tool_result", "tool_use_id": tool_use_id, "content": content, "is_error": is_error})
+                }
+            })
         })
         .collect();
     json!({"role": role, "content": content})
@@ -302,13 +319,13 @@ impl StreamState {
             None => return Err(ToolError::new(ErrorCode::Truncated, "The answer stream ended early.").with_remediation("Try again.")),
         };
         let model = if self.model.is_empty() { fallback_model.to_string() } else { self.model };
-        Ok(TurnResult { message: Msg { role: Speaker::Assistant, blocks }, stop, usage: self.usage, model })
+        Ok(TurnResult { message: Msg { role: Speaker::Assistant, blocks }, stop, usage: self.usage, model, follow_up: None })
     }
 }
 
 impl ChatModel for Anthropic {
     fn turn(&mut self, req: &TurnRequest<'_>, on_delta: &mut dyn FnMut(Delta), stop: &Stop) -> Result<TurnResult, ToolError> {
-        let agent = http::stream_agent();
+        let agent = http::stream_agent(self.stream_limit);
         let reader = http::post_json(&agent, "Anthropic", &self.url("messages"), &self.headers(), &self.body(req))?;
         let mut state = StreamState::default();
         http::parse_sse(reader, |ev| {
@@ -343,6 +360,17 @@ mod tests {
     use super::*;
     use crate::model::Effort;
 
+    /// #1100: Anthropic's own address is told apart by its host, not by a look-alike.
+    #[test]
+    fn anthropics_own_address_is_recognised() {
+        for yes in ["https://api.anthropic.com/v1", "https://api.anthropic.com", "HTTPS://API.Anthropic.com/v1/"] {
+            assert!(is_anthropic_api(yes), "{yes}");
+        }
+        for no in ["http://api.anthropic.com/v1", "https://api.anthropic.com.example.test/v1", "https://proxy.test/api.anthropic.com/v1", "api.anthropic.com"] {
+            assert!(!is_anthropic_api(no), "{no}");
+        }
+    }
+
     #[test]
     fn body_has_required_fields() {
         let a = Anthropic::new(None, "k".into(), "");
@@ -361,11 +389,16 @@ mod tests {
         assert!(b["tools"][0].get("cache_control").is_none());
         assert_eq!(b["tools"][1]["cache_control"]["type"], "ephemeral");
         assert_eq!(b["system"][0]["cache_control"]["type"], "ephemeral");
-        assert!(a.headers().iter().any(|(k, v)| *k == "anthropic-beta" && v == FALLBACK_BETA));
+        // #1585: a thinking block from before a summary is dropped, not a reason to refuse the turn.
+        assert_eq!(b["thinking"]["block_binding"]["prefix_mismatch_behavior"], "drop_block");
+        let betas = |a: &Anthropic| a.headers().into_iter().find(|(k, _)| *k == "anthropic-beta").map(|(_, v)| v).unwrap_or_default();
+        assert_eq!(betas(&a).split(',').collect::<Vec<_>>(), [THINKING_BINDING_BETA, FALLBACK_BETA]);
         let mut off = a.clone();
         off.fallbacks = false;
-        assert!(off.body(&TurnRequest { system: "s", messages: &msgs, tools: &[], effort: Effort::Low, max_tokens: 10 }).get("fallbacks").is_none());
-        assert!(off.headers().iter().all(|(k, _)| *k != "anthropic-beta"));
+        let without = off.body(&TurnRequest { system: "s", messages: &msgs, tools: &[], effort: Effort::Low, max_tokens: 10 });
+        assert!(without.get("fallbacks").is_none());
+        assert_eq!(without["thinking"]["block_binding"]["prefix_mismatch_behavior"], "drop_block");
+        assert_eq!(betas(&off), THINKING_BINDING_BETA, "block_binding is refused without its beta header");
     }
 
     /// Every level goes to a model that has it; one that lacks it gets the nearest level below.

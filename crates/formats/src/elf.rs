@@ -7,11 +7,10 @@ use crate::{FormatError, hex_addr};
 use object::Object;
 use serde::Serialize;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-const MAX_PHDRS: usize = 4096;
-const MAX_DYN: usize = 65_536;
 const MAX_NOTES: usize = 100_000;
+const MAX_FILE_MAPPINGS: usize = 65_536;
 
 /// Endian/class-aware reads over an ELF image.
 #[derive(Clone, Copy)]
@@ -51,155 +50,25 @@ impl<'a> E<'a> {
     }
 }
 
-/// One program header.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ProgramHeader {
-    pub kind: String,
-    pub flags: String,
-    pub offset: u64,
-    #[serde(with = "hex_addr")]
-    pub vaddr: u64,
-    pub file_size: u64,
-    pub mem_size: u64,
-    pub align: u64,
-    #[serde(skip)]
-    pub p_type: u32,
-    #[serde(skip)]
-    pub p_flags: u32,
-}
+pub use craft_elf::ProgramHeader;
+use craft_elf::{dynamic_tag_name as dyn_name, va_to_off};
 
-fn phdr_name(t: u32) -> String {
-    match t {
-        0 => "NULL".into(),
-        1 => "LOAD".into(),
-        2 => "DYNAMIC".into(),
-        3 => "INTERP".into(),
-        4 => "NOTE".into(),
-        5 => "SHLIB".into(),
-        6 => "PHDR".into(),
-        7 => "TLS".into(),
-        0x6474_e550 => "GNU_EH_FRAME".into(),
-        0x6474_e551 => "GNU_STACK".into(),
-        0x6474_e552 => "GNU_RELRO".into(),
-        0x6474_e553 => "GNU_PROPERTY".into(),
-        0x7000_0001 => "ARM_EXIDX".into(),
-        other => format!("{other:#x}"),
-    }
-}
-
-fn perm_string(f: u32) -> String {
-    format!("{}{}{}", if f & 4 != 0 { 'r' } else { '-' }, if f & 2 != 0 { 'w' } else { '-' }, if f & 1 != 0 { 'x' } else { '-' })
-}
-
-/// The program headers of an ELF file.
+/// The program headers of an ELF file, preserving the app's error contract.
 pub fn program_headers(data: &[u8]) -> Result<Vec<ProgramHeader>, FormatError> {
-    let e = E::new(data)?;
-    let (phoff, phentsize, phnum) = if e.is64 { (e.u64(32), e.u16(54), e.u16(56)) } else { (e.u32(28).map(u64::from), e.u16(42), e.u16(44)) };
-    let phoff = usize::try_from(phoff.ok_or_else(|| FormatError::Truncated("ELF header".into()))?).map_err(|_| FormatError::Malformed("phoff".into()))?;
-    let phentsize = usize::from(phentsize.unwrap_or(0));
-    let phnum = usize::from(phnum.unwrap_or(0)).min(MAX_PHDRS);
-    let min = if e.is64 { 56 } else { 32 };
-    if phnum > 0 && phentsize < min {
-        return Err(FormatError::Malformed("program header entry too small".into()));
-    }
-    let mut out = Vec::new();
-    for i in 0..phnum {
-        // The fields below sit within `phentsize` bytes of `o`, so their offsets can't overflow either.
-        let Some(o) = i.checked_mul(phentsize).and_then(|x| x.checked_add(phoff)).filter(|&o| o.checked_add(phentsize).is_some()) else { break };
-        let ph = if e.is64 {
-            (e.u32(o), e.u32(o + 4), e.u64(o + 8), e.u64(o + 16), e.u64(o + 32), e.u64(o + 40), e.u64(o + 48))
-        } else {
-            (
-                e.u32(o),
-                e.u32(o + 24),
-                e.u32(o + 4).map(u64::from),
-                e.u32(o + 8).map(u64::from),
-                e.u32(o + 16).map(u64::from),
-                e.u32(o + 20).map(u64::from),
-                e.u32(o + 28).map(u64::from),
-            )
-        };
-        let (Some(t), Some(f), Some(off), Some(va), Some(fs), Some(ms), Some(al)) = ph else { break };
-        out.push(ProgramHeader {
-            kind: phdr_name(t),
-            flags: perm_string(f),
-            offset: off,
-            vaddr: va,
-            file_size: fs,
-            mem_size: ms,
-            align: al,
-            p_type: t,
-            p_flags: f,
-        });
-    }
-    Ok(out)
+    craft_elf::program_headers(data).map_err(|error| match error {
+        craft_elf::ElfError::Truncated(context) => FormatError::Truncated(context.into()),
+        craft_elf::ElfError::Malformed(context) => FormatError::Malformed(context),
+    })
 }
 
-fn dyn_name(tag: u64) -> String {
-    match tag {
-        0 => "NULL",
-        1 => "NEEDED",
-        2 => "PLTRELSZ",
-        3 => "PLTGOT",
-        4 => "HASH",
-        5 => "STRTAB",
-        6 => "SYMTAB",
-        7 => "RELA",
-        8 => "RELASZ",
-        9 => "RELAENT",
-        10 => "STRSZ",
-        11 => "SYMENT",
-        12 => "INIT",
-        13 => "FINI",
-        14 => "SONAME",
-        15 => "RPATH",
-        16 => "SYMBOLIC",
-        17 => "REL",
-        18 => "RELSZ",
-        19 => "RELENT",
-        20 => "PLTREL",
-        21 => "DEBUG",
-        22 => "TEXTREL",
-        23 => "JMPREL",
-        24 => "BIND_NOW",
-        25 => "INIT_ARRAY",
-        26 => "FINI_ARRAY",
-        27 => "INIT_ARRAYSZ",
-        28 => "FINI_ARRAYSZ",
-        29 => "RUNPATH",
-        30 => "FLAGS",
-        0x6fff_fef5 => "GNU_HASH",
-        0x6fff_fffb => "FLAGS_1",
-        0x6fff_fff0 => "VERSYM",
-        0x6fff_fffe => "VERNEED",
-        0x6fff_ffff => "VERNEEDNUM",
-        _ => return format!("{tag:#x}"),
-    }
-    .into()
-}
-
-/// Map a virtual address to a file offset using PT_LOAD headers.
-fn va_to_off(phdrs: &[ProgramHeader], va: u64) -> Option<u64> {
-    phdrs.iter().filter(|p| p.p_type == 1).find(|p| va >= p.vaddr && va - p.vaddr < p.file_size).and_then(|p| p.offset.checked_add(va - p.vaddr))
-}
-
-/// The (tag, value) pairs of the dynamic section, up to its `DT_NULL`.
 fn dynamic_entries(e: &E<'_>, phdrs: &[ProgramHeader]) -> Vec<(u64, u64)> {
-    let mut out = Vec::new();
-    let Some(d) = phdrs.iter().find(|p| p.p_type == 2) else { return out };
-    let ent = 2 * e.word_size();
-    let n = usize::try_from(d.file_size).unwrap_or(0) / ent;
-    let start = usize::try_from(d.offset).unwrap_or(usize::MAX);
-    for i in 0..n.min(MAX_DYN) {
-        let Some(o) = i.checked_mul(ent).and_then(|x| start.checked_add(x)) else { break };
-        let (Some(tag), Some(val)) = (e.word(o), o.checked_add(e.word_size()).and_then(|v| e.word(v))) else { break };
-        if tag == 0 {
-            break;
-        }
-        out.push((tag, val));
-    }
-    out
+    // E::new already validated the same immutable ELF ident.
+    craft_elf::dynamic_entries(e.r.data(), phdrs).unwrap_or_default()
 }
+
+#[cfg(test)]
+#[path = "elf_legacy.rs"]
+mod legacy;
 
 /// Add ELF facts to a parsed binary: image base, interpreter, needed libraries, RELRO, NX, PIE.
 pub fn enrich(data: &[u8], file: &object::File<'_>, b: &mut Binary) {
@@ -217,9 +86,16 @@ pub fn enrich(data: &[u8], file: &object::File<'_>, b: &mut Binary) {
     }
     let dyns = dynamic_entries(&e, &phdrs);
     let strtab = dyns.iter().find(|(t, _)| *t == 5).and_then(|(_, v)| va_to_off(&phdrs, *v));
+    let strsz = dyns.iter().find(|(t, _)| *t == DT_STRSZ).map(|(_, size)| *size);
     let dstr = |v: u64| -> Option<String> {
         let off = usize::try_from(strtab?.checked_add(v)?).ok()?;
-        e.r.cstr(off, 4096)
+        let Some(size) = strsz else { return e.r.cstr(off, 4096) };
+        let left = usize::try_from(size.checked_sub(v)?).unwrap_or(usize::MAX);
+        let rest = data.get(off..)?;
+        let window = rest.get(..left.min(rest.len()).min(4096))?;
+        // Keep the existing preview cap for long names, but never continue into the next table.
+        let end = window.iter().position(|&b| b == 0).or_else(|| (window.len() == 4096 && left > 4096).then_some(4096))?;
+        Some(String::from_utf8_lossy(window.get(..end)?).into_owned())
     };
     let mut flags = 0u64;
     let mut flags1 = 0u64;
@@ -301,9 +177,9 @@ pub fn enrich(data: &[u8], file: &object::File<'_>, b: &mut Binary) {
         "dt_flags": format!("{flags:#x}"),
         "dt_flags_1": format!("{flags1:#x}"),
     });
-    // With no section headers `object` finds no symbols; the dynamic section still points at them.
-    if b.sections.is_empty()
-        && let Some(ds) = dynamic_symbols(data, b)
+    // Other sections may survive after the dynamic-symbol section was removed.
+    if file.dynamic_symbols().next().is_none()
+        && let Some(ds) = segment_dynamic_symbols(data, &e)
     {
         add_dynamic_symbols(b, ds);
     }
@@ -313,7 +189,11 @@ pub fn enrich(data: &[u8], file: &object::File<'_>, b: &mut Binary) {
 fn add_dynamic_symbols(b: &mut Binary, ds: DynamicSymbols) {
     b.warnings.extend(ds.warnings.into_iter().map(|w| format!("dynamic symbols: {w}")));
     b.symbols_truncated |= ds.truncated;
+    let mut known: BTreeSet<(String, u64)> = b.symbols.iter().map(|s| (s.name.clone(), s.addr)).collect();
     for (s, defined) in ds.exports.iter().map(|s| (s, true)).chain(ds.imports.iter().map(|s| (s, false))) {
+        if !known.insert((s.name.clone(), s.addr)) {
+            continue;
+        }
         if b.symbols.len() >= MAX_SYMBOLS {
             b.symbols_truncated = true;
             break;
@@ -335,9 +215,17 @@ fn add_dynamic_symbols(b: &mut Binary, ds: DynamicSymbols) {
             dynamic: true,
         });
     }
-    b.exports.extend(ds.exports.iter().take(MAX_IMPORTS).map(|s| Export { name: s.name.clone(), addr: s.addr }));
+    let mut exports: BTreeSet<(String, u64)> = b.exports.iter().map(|s| (s.name.clone(), s.addr)).collect();
+    let room = MAX_IMPORTS.saturating_sub(b.exports.len());
+    b.exports.extend(ds.exports.iter().filter(|s| exports.insert((s.name.clone(), s.addr))).take(room).map(|s| Export { name: s.name.clone(), addr: s.addr }));
+    let mut imports: BTreeSet<(String, Option<String>)> = b.imports.iter().map(|s| (s.name.clone(), s.library.clone())).collect();
     let room = MAX_IMPORTS.saturating_sub(b.imports.len());
-    b.imports.extend(ds.imports.into_iter().take(room).map(|s| Import { name: s.name, library: s.library, ordinal: None, slot: None }));
+    b.imports.extend(ds.imports.into_iter().filter(|s| imports.insert((s.name.clone(), s.library.clone()))).take(room).map(|s| Import {
+        name: s.name,
+        library: s.library,
+        ordinal: None,
+        slot: None,
+    }));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -596,9 +484,9 @@ pub fn dynamic_symbols(data: &[u8], b: &Binary) -> Option<DynamicSymbols> {
         return segment_dynamic_symbols(data, &e);
     };
     let off_of = |name: &str| b.sections.iter().find(|s| s.name == name).and_then(|s| s.file_offset).and_then(|o| usize::try_from(o).ok());
-    let defs = off_of(".gnu.version_d").map(|o| version_defs(&e, o, strs)).unwrap_or_default();
-    let needs = off_of(".gnu.version_r").map(|o| version_needs(&e, o, strs)).unwrap_or_default();
-    let versym = off_of(".gnu.version");
+    let defs = section_bytes(data, b, ".gnu.version_d").map(|bytes| version_defs(&E { r: Reader::new(bytes), ..e }, 0, strs)).unwrap_or_default();
+    let needs = section_bytes(data, b, ".gnu.version_r").map(|bytes| version_needs(&E { r: Reader::new(bytes), ..e }, 0, strs)).unwrap_or_default();
+    let versym = section_bytes(data, b, ".gnu.version");
     let syms_off = off_of(".dynsym")?;
     let mut out = DynamicSymbols::default();
     read_dynsyms(&e, (syms_off, syms.len() / ent), strs, versym, &defs, &needs, &mut out);
@@ -627,7 +515,7 @@ fn segment_dynamic_symbols(data: &[u8], e: &E<'_>) -> Option<DynamicSymbols> {
         out.truncated = true;
         out.warnings.push(format!("the symbol table ends early: {room} of {count} entries are in the file"));
     }
-    read_dynsyms(e, (symtab, count.min(room)), strs, off_of(DT_VERSYM), &defs, &needs, &mut out);
+    read_dynsyms(e, (symtab, count.min(room)), strs, off_of(DT_VERSYM).and_then(|off| data.get(off..)), &defs, &needs, &mut out);
     Some(out)
 }
 
@@ -637,7 +525,7 @@ fn read_dynsyms(
     e: &E<'_>,
     (syms_off, count): (usize, usize),
     strs: &[u8],
-    versym: Option<usize>,
+    versym: Option<&[u8]>,
     defs: &BTreeMap<u16, String>,
     needs: &Needs,
     out: &mut DynamicSymbols,
@@ -668,7 +556,7 @@ fn read_dynsyms(
             _ => "other",
         };
         let Some(text) = str_at(strs, name).filter(|t| !t.is_empty()) else { continue };
-        let index = versym.and_then(|v| v.checked_add(i.checked_mul(2)?)).and_then(|v| e.u16(v)).map(|v| v & 0x7fff);
+        let index = versym.and_then(|bytes| E { r: Reader::new(bytes), ..*e }.u16(i.checked_mul(2)?)).map(|v| v & 0x7fff);
         let defined = shndx != 0;
         let (version, library) = match index {
             Some(ix) if ix >= 2 => {
@@ -971,16 +859,26 @@ pub fn parse_core(data: &[u8]) -> Result<CoreDump, FormatError> {
                         core.signal = Some(SigInfo { signo, name: signal_name(signo), code, errno, fault_addr: fault, meaning: signal_meaning(signo, code) });
                     }
                     0x4649_4c45 => {
-                        let count = usize::try_from(d.word(0).unwrap_or(0)).unwrap_or(0).min(65_536);
+                        let declared = d.word(0).unwrap_or(0);
+                        let count = usize::try_from(declared).unwrap_or(usize::MAX);
                         let page = d.word(ws).unwrap_or(4096);
                         let table = 2 * ws;
-                        let mut names_off = table.saturating_add(count.saturating_mul(3 * ws));
-                        for i in 0..count {
-                            let o = table + i * 3 * ws;
-                            let (Some(s), Some(en), Some(po)) = (d.word(o), d.word(o + ws), d.word(o + 2 * ws)) else { break };
-                            let path = d.r.cstr(names_off, 4096).unwrap_or_default();
-                            names_off = names_off.saturating_add(path.len() + 1);
-                            core.mapped_files.push(MappedFile { start: s, end: en, file_offset: po.saturating_mul(page), path });
+                        let names_off = count.checked_mul(3 * ws).and_then(|bytes| table.checked_add(bytes)).filter(|&off| off <= desc.len());
+                        if let Some(mut names_off) = names_off {
+                            if count > MAX_FILE_MAPPINGS {
+                                core.warnings.push(format!("NT_FILE lists {declared} mappings; reading the first {MAX_FILE_MAPPINGS}"));
+                            }
+                            for i in 0..count.min(MAX_FILE_MAPPINGS) {
+                                let o = table + i * 3 * ws;
+                                let (Some(s), Some(en), Some(po)) = (d.word(o), d.word(o + ws), d.word(o + 2 * ws)) else { break };
+                                let path = d.r.cstr(names_off, 4096).unwrap_or_default();
+                                let raw = desc.get(names_off..).unwrap_or_default();
+                                let consumed = raw.iter().position(|&byte| byte == 0).map_or(raw.len(), |end| end + 1);
+                                names_off = names_off.saturating_add(consumed);
+                                core.mapped_files.push(MappedFile { start: s, end: en, file_offset: po.saturating_mul(page), path });
+                            }
+                        } else {
+                            core.warnings.push("NT_FILE mapping table runs past the note; skipped its mappings".into());
                         }
                     }
                     6 => {
@@ -1018,6 +916,22 @@ pub fn parse_core(data: &[u8]) -> Result<CoreDump, FormatError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn needed_names_must_fit_the_dynamic_string_table() {
+        let (mut data, _) = craft_anything_testkit::elf64(craft_anything_testkit::ElfArch::X86_64, true);
+        let header = program_headers(&data).unwrap().into_iter().find(|ph| ph.p_type == 2).unwrap();
+        let start = header.offset as usize;
+        let end = start + header.file_size as usize;
+        let size_entry = data[start..end].as_chunks::<16>().0.iter().position(|e| e[..8] == 10u64.to_le_bytes()).unwrap();
+        let size_at = start + size_entry * 16 + 8;
+        assert_eq!(crate::parse_binary(&data).unwrap().libraries, ["libc.so.6"]);
+        // The dependency starts at byte 6, with its NUL at byte 15.
+        for size in [6u64, 15] {
+            data[size_at..size_at + 8].copy_from_slice(&size.to_le_bytes());
+            assert!(crate::parse_binary(&data).unwrap().libraries.is_empty(), "DT_STRSZ={size}");
+        }
+    }
+
     #[test]
     fn a_string_stops_at_its_nul_or_the_cap() {
         assert_eq!(super::str_at(b"ab\0cd\0", 3).as_deref(), Some("cd"));
@@ -1194,5 +1108,110 @@ mod sectionless_tests {
         let ds = dynamic_symbols(&d, &b).unwrap();
         assert!(ds.truncated && !ds.warnings.is_empty());
         assert_eq!(ds.exports.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod shared_parity {
+    use super::*;
+    fn compare(data: &[u8]) {
+        let old = legacy::program_headers(data);
+        let new = program_headers(data);
+        match (old, new) {
+            (Ok(old), Ok(new)) => {
+                assert_eq!(serde_json::to_value(&old).unwrap(), serde_json::to_value(&new).unwrap());
+                assert_eq!(old.iter().map(|p| (p.p_type, p.p_flags)).collect::<Vec<_>>(), new.iter().map(|p| (p.p_type, p.p_flags)).collect::<Vec<_>>());
+                assert_eq!(legacy::dynamic(data, &old), craft_elf::dynamic_entries(data, &new).unwrap());
+            }
+            (Err(old), Err(new)) => assert_eq!(format!("{old:?}"), format!("{new:?}")),
+            other => panic!("ELF parity mismatch: {other:?}"),
+        }
+    }
+    #[test]
+    fn shared_dynamic_count_termination_and_overflow_match() {
+        for class in [1u8, 2] {
+            for endian in [1u8, 2] {
+                let width = if class == 1 { 4 } else { 8 };
+                let mut data = vec![0; 64 + width * 2 * 70_000];
+                data[..4].copy_from_slice(b"\x7fELF");
+                data[4] = class;
+                data[5] = endian;
+                for i in 0..70_000 {
+                    data[64 + i * width * 2 + if endian == 1 { 0 } else { width - 1 }] = 1;
+                }
+                let old = legacy::ProgramHeader {
+                    kind: "DYNAMIC".into(),
+                    flags: "---".into(),
+                    offset: 64,
+                    vaddr: 0,
+                    file_size: (width * 2 * 70_000) as u64,
+                    mem_size: 0,
+                    align: 0,
+                    p_type: 2,
+                    p_flags: 0,
+                };
+                let new = ProgramHeader {
+                    kind: old.kind.clone(),
+                    flags: old.flags.clone(),
+                    offset: old.offset,
+                    vaddr: 0,
+                    file_size: old.file_size,
+                    mem_size: 0,
+                    align: 0,
+                    p_type: 2,
+                    p_flags: 0,
+                };
+                for (offset, size) in [(64, old.file_size), (u64::MAX, u64::MAX), (64, 3), (64, u64::MAX)] {
+                    let old = legacy::ProgramHeader { offset, file_size: size, ..old.clone() };
+                    let new = ProgramHeader { offset, file_size: size, ..new.clone() };
+                    assert_eq!(legacy::dynamic(&data, &[old]), dynamic_entries(&E::new(&data).unwrap(), &[new]));
+                }
+                assert_eq!(dynamic_entries(&E::new(&data).unwrap(), std::slice::from_ref(&new)).len(), 65_536);
+                data[64..64 + width].fill(0);
+                assert!(dynamic_entries(&E::new(&data).unwrap(), &[new]).is_empty());
+            }
+        }
+    }
+    #[test]
+    fn shared_header_errors_serialization_and_caps_match() {
+        for class in [1u8, 2] {
+            for endian in [1u8, 2] {
+                let mut data = vec![0; 64 + 56 * 5000];
+                data[..4].copy_from_slice(b"\x7fELF");
+                data[4] = class;
+                data[5] = endian;
+                let put16 = |data: &mut [u8], off: usize, v: u16| {
+                    data[off..off + 2].copy_from_slice(&if endian == 1 { v.to_le_bytes() } else { v.to_be_bytes() });
+                };
+                let put32 = |data: &mut [u8], off: usize, v: u32| {
+                    data[off..off + 4].copy_from_slice(&if endian == 1 { v.to_le_bytes() } else { v.to_be_bytes() });
+                };
+                if class == 1 {
+                    put32(&mut data, 28, 64);
+                    put16(&mut data, 42, 32);
+                    put16(&mut data, 44, 5000);
+                } else {
+                    data[if endian == 1 { 32 } else { 39 }] = 64;
+                    put16(&mut data, 54, 56);
+                    put16(&mut data, 56, 5000);
+                }
+                for i in 0..5000 {
+                    let off = 64 + i * if class == 1 { 32 } else { 56 };
+                    put32(&mut data, off, 1);
+                }
+                compare(&data);
+                assert_eq!(program_headers(&data).unwrap().len(), 4096);
+                for len in 0..200 {
+                    compare(&data[..len]);
+                }
+                for pos in 0..128 {
+                    let old = data[pos];
+                    data[pos] = 255;
+                    compare(&data);
+                    data[pos] = old;
+                }
+            }
+        }
+        compare(b"not elf");
     }
 }

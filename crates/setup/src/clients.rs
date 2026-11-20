@@ -56,11 +56,14 @@ pub struct Host {
 }
 
 impl Host {
-    /// The real machine: the user's home and only the config-related environment variables.
+    /// The real machine: the user's home and only the config-related environment variables. On
+    /// Windows the apps keep their settings in the user profile and ignore HOME, which a shell such
+    /// as MSYS2 or Cygwin points elsewhere, so USERPROFILE comes first there.
     pub fn current() -> Host {
-        let home = std::env::var_os("HOME")
+        let (first, second) = if cfg!(windows) { ("USERPROFILE", "HOME") } else { ("HOME", "USERPROFILE") };
+        let home = std::env::var_os(first)
             .filter(|h| !h.is_empty())
-            .or_else(|| std::env::var_os("USERPROFILE"))
+            .or_else(|| std::env::var_os(second).filter(|h| !h.is_empty()))
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         let env = ENV_KEYS.iter().filter_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()).map(|v| (k.to_string(), v))).collect();
@@ -76,13 +79,37 @@ impl Host {
         self.env.get(k).filter(|v| !v.is_empty()).map(|v| self.expand(v))
     }
 
-    /// Expand a leading `~` and make relative paths relative to home.
+    /// Expand a leading `~` (`~/...`, plus `~\...` on Windows) and make relative paths relative to home.
     fn expand(&self, v: &str) -> PathBuf {
         if v == "~" {
             return self.home.clone();
         }
+        if self.os == Os::Windows
+            && let Some(rest) = v.strip_prefix("~/").or_else(|| v.strip_prefix("~\\"))
+        {
+            let rest = rest.trim_start_matches(['/', '\\']);
+            let is_drive_abs = matches!(rest.as_bytes(), [d, b':', b'/' | b'\\', ..] if d.is_ascii_alphabetic());
+            if is_drive_abs {
+                return PathBuf::from(rest);
+            }
+            if !rest.contains(':') {
+                return rest.split(['/', '\\']).filter(|s| !s.is_empty()).fold(self.home.clone(), |acc, seg| acc.join(seg));
+            }
+            // `rest` contains `:` without a leading `[A-Za-z]:[/\\]`: append via `OsString` so
+            // relative colon segments such as `C:rel` or `sub\C:\other` stay rooted under `home`.
+            let mut raw = self.home.clone().into_os_string();
+            if !rest.is_empty() {
+                let home_s = self.home.to_string_lossy();
+                if !home_s.ends_with(['/', '\\']) {
+                    raw.push(std::path::MAIN_SEPARATOR_STR);
+                }
+                raw.push(rest);
+            }
+            return PathBuf::from(raw);
+        }
         if let Some(rest) = v.strip_prefix("~/") {
-            return self.home.join(rest);
+            let rest = rest.trim_start_matches('/');
+            return if rest.is_empty() { self.home.clone() } else { self.home.join(rest) };
         }
         let p = PathBuf::from(v);
         if p.is_absolute() { p } else { self.home.join(p) }
@@ -141,7 +168,7 @@ pub enum Shape {
     WithStartupTimeout,
     /// `{command, args, startup_timeout_sec: 30, tools: {<tool>: {approval_mode: "approve"}}}`:
     /// `codex exec` can't ask, so it refuses a tool not marked read-only unless the entry approves
-    /// it (#540). Only the tools that ask the person themselves are approved
+    /// it (#540). Only the tools we limit ourselves (consent, or the asset budget) are approved
     /// ([`craft_anything_engine::AGENT_APP_PREAPPROVED_TOOLS`]); other settings in the entry are kept.
     Codex,
 }
@@ -375,16 +402,7 @@ pub fn clients(host: &Host) -> Vec<Client> {
 
     // Qoder
     let qoder = host.var("QODER_CONFIG_DIR").unwrap_or_else(|| h.join(".qoder"));
-    add(
-        "qoder",
-        "Qoder",
-        qoder.join("settings.json"),
-        vec![qoder.clone()],
-        Format::Jsonc,
-        vec!["mcpServers"],
-        Shape::Plain,
-        Some(h.join(".qoder").join("skills")),
-    );
+    add("qoder", "Qoder", qoder.join("settings.json"), vec![qoder.clone()], Format::Jsonc, vec!["mcpServers"], Shape::Plain, Some(qoder.join("skills")));
 
     // Devin
     let devin = match host.os {

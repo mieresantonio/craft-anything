@@ -20,6 +20,8 @@ pub const ROUTES_FILE: &str = "routes.json";
 /// desktop width; [`phone_states_dir`] holds them at the phone width (a menu button often only
 /// shows there).
 pub const STATES_DIR: &str = "states";
+/// What a new site's builder is told to leave for running it outside Craft Anything.
+pub const HOW_TO_RUN: &str = "Craft Anything serves your built folder itself, so the site needs no dev or start script here. For anyone running it without Craft Anything, write app/README.md saying how: the commands that build it (such as `npm install` and `npm run build`, or none for plain files) and the folder to serve with any static web server (for example `npx serve dist`), since opening index.html straight from the disk may not work.";
 
 /// The folder for the states opened at a phone `width`: `states-390`.
 pub fn phone_states_dir(width: u32) -> String {
@@ -141,10 +143,33 @@ impl TargetKind for WebsiteKind {
         }
     }
 
+    /// A website wins when the target already is one, the request names one, or the chosen stack
+    /// builds sites. The generic word "web" is not enough: "a web app" is an app.
     fn detect(&self, cx: &DetectCx) -> Option<u32> {
         if matches!(cx.target, TargetRef::Website { .. }) {
             Some(100)
-        } else if cx.says(&[" website", " web page", " webpage", " landing page", " site ", " webseite", " internetseite", "网站", "網站", "网页", "網頁"])
+        } else if cx.says(&[
+            " website",
+            " web page",
+            " webpage",
+            " landing page",
+            " site ",
+            " webseite",
+            " internetseite",
+            " sitio web",
+            " página web",
+            " pagina web",
+            " sito ",
+            " web sitesi",
+            " internet sitesi",
+            " trang web",
+            "เว็บไซต์",
+            "หน้าเว็บ",
+            "网站",
+            "網站",
+            "网页",
+            "網頁",
+        ]) || says_site_in_estonian(cx)
         {
             Some(50)
         } else if matches!(cx.target, TargetRef::None) && stacks::get(cx.stack).is_some_and(|s| s.site) {
@@ -184,6 +209,10 @@ impl TargetKind for WebsiteKind {
                 states.join(", ")
             ));
         }
+        // Craft Anything serves the built folder itself, so outside it there was nothing to run (#1590).
+        if !cx.ws.manifest.own_project() {
+            out.push(HOW_TO_RUN.into());
+        }
         out
     }
 
@@ -192,10 +221,16 @@ impl TargetKind for WebsiteKind {
         if matches!(ws.manifest.target, TargetRef::Website { .. }) { vec![Box::new(WebVisualCheck)] } else { vec![Box::new(BuildCheck)] }
     }
 
-    fn refine(&self, check: &CheckResult) -> String {
+    fn refine(&self, check: &CheckResult, sees_pictures: bool) -> String {
         match check.similarity {
-            Some(s) => format!(
+            Some(s) if sees_pictures => format!(
                 "Check {}: compared with the original, your build looks {s:.0}% alike ({}). Your screenshots are in checks/round-{}/ (screenshot-<width>.png for each width, and routes/<page>/ for other pages) with the layout measured at each width in its capture.json; the original's are in capture/. Open each pair with the Read tool, fix the biggest visible differences first (layout and section order, spacing, sizes, colours, fonts, missing parts), fix the padding, items per row, sizes, colours and fonts the check names at each width with the exact values it gives, add any missing headings or words it lists, build it again, and reply with 1-2 plain sentences on what you changed.",
+                check.round, check.note, check.round
+            ),
+            // The likeness is measured from the screenshots, but the same measurements are in
+            // text: the build's capture.json beside the original's.
+            Some(s) => format!(
+                "Check {}: compared with the original, your build looks {s:.0}% alike ({}). The check measured your build at each width the same way as the original: compare checks/round-{}/capture.json (and routes/<page>/capture.json for other pages) with capture/capture.json, fix the layout and section order and anything missing first, then the padding, items per row, sizes, colours and fonts the check names at each width with the exact values it gives, add any missing headings or words it lists, build it again, and reply with 1-2 plain sentences on what you changed.",
                 check.round, check.note, check.round
             ),
             None => format!(
@@ -483,12 +518,18 @@ pub fn page_claims(page: &str, original: &Value, built: &Value) -> Vec<Claim> {
 /// A `#rrggbb` or `#rrggbbaa` colour as (r, g, b, a).
 fn rgba(c: &str) -> Option<[u8; 4]> {
     let h = c.strip_prefix('#')?;
-    let byte = |i: usize| h.get(i..i + 2).and_then(|x| u8::from_str_radix(x, 16).ok());
+    let byte = |i: usize| h.get(i..i + 2).filter(|x| x.bytes().all(|b| b.is_ascii_hexdigit())).and_then(|x| u8::from_str_radix(x, 16).ok());
     match h.len() {
         6 => Some([byte(0)?, byte(2)?, byte(4)?, 255]),
         8 => Some([byte(0)?, byte(2)?, byte(4)?, byte(6)?]),
         _ => None,
     }
+}
+
+/// Whether the request names a website in Estonian. `DetectCx::words` turns punctuation and
+/// newlines into spaces, so a cue after them still counts.
+fn says_site_in_estonian(cx: &DetectCx) -> bool {
+    cx.words.split_whitespace().any(is_site_word)
 }
 
 /// The same colour to the eye: each channel within 3 (rounding in the browser), or the same text.
@@ -639,6 +680,15 @@ pub fn pair_states<'a>(original: &'a Value, built: &'a Value) -> Vec<(&'a Value,
     rows(original).map(|o| (o, rows(built).find(|b| key(b) == key(o)))).collect()
 }
 
+/// The study used a saved profile and detected no password page (`capture.json`'s typed
+/// `signed_in` and `sign_in_page`, #1178). This does not establish authentication: a rejected
+/// session may lead to a public page or a passwordless sign-in step instead.
+pub fn captured_signed_in(ws: &Workspace) -> bool {
+    let Some(c) = read_json(&ws.capture_dir().join("capture.json")) else { return false };
+    let yes = |k: &str| c.get(k).and_then(Value::as_bool).unwrap_or(false);
+    yes("signed_in") && !yes("sign_in_page")
+}
+
 /// Read a JSON file, or None.
 fn read_json(path: &Path) -> Option<Value> {
     std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok())
@@ -682,7 +732,7 @@ fn states_note(cx: &CheckCx, base: &str, out: &Path, dir: &str, unknowns: &mut V
         return Ok(None);
     }
     let ours = out.join(dir);
-    cx.call("web_site_open", json!({"url": base, "settle_ms": 1200}))?;
+    cx.call("web_site_open", json!({"url": base, "settle_ms": 1200, "signed_in": false}))?;
     // More than the study opened, so the same controls are found even when the build orders them differently.
     let width = original.get("width").and_then(Value::as_u64).unwrap_or(1440);
     if let Err(e) = cx.call("web_page_states_capture", json!({"output_directory": ours.display().to_string(), "max_states": 8, "width": width})) {
@@ -767,7 +817,7 @@ impl Check for WebVisualCheck {
             if let Some(parent) = built.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| ToolError::io(parent.display(), e))?;
             }
-            cx.call("web_site_open", json!({"url": url, "settle_ms": 1200}))?;
+            cx.call("web_site_open", json!({"url": url, "settle_ms": 1200, "signed_in": false}))?;
             cx.call("web_site_capture", json!({"output_directory": built.display().to_string(), "include_html": false, "widths": widths}))?;
             let mut per_width = Vec::new();
             for &w in &widths {
@@ -836,6 +886,14 @@ impl Check for WebVisualCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rgba_rejects_non_hex_digits() {
+        for bad in ["#+1+2+3", "#-1-2-3", "#+1+2+3ff", "#12345g"] {
+            assert_eq!(rgba(bad), None, "{bad}");
+        }
+        assert_eq!(rgba("#0a0B0c"), Some([10, 11, 12, 255]));
+    }
 
     /// #736: an empty app/ is said to be empty, so a builder that claims a build can't hide it; a
     /// folder with files, or a project folder (which always holds the workspace's own), isn't.

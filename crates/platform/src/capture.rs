@@ -13,11 +13,11 @@
 //! - nothing ever blocks forever: every wait is bounded.
 //!
 //! Capture executes foreign code, so the engine gates the tool that calls this behind consent.
-//! On Windows there is no terminal to render into: the program runs through [`crate::process`]
-//! (its Job Object ends every process in it on timeout, cancel or drop) and its output is read
+//! On Windows there is no terminal to render into, and on other hosts (FreeBSD) the terminal loses
+//! a short program's output: there the program runs through [`crate::process`] (its Job Object or
+//! process group ends every process in it on timeout, cancel or drop) and its output is read
 //! through pipes, which the result says; scripted events and watched files need the terminal
-//! capture and are refused there. On other hosts (FreeBSD) [`capture`] returns a clear error
-//! rather than pretending.
+//! capture and are refused there.
 #![cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code, unused_imports))]
 
 use crate::process::Cancel;
@@ -314,23 +314,30 @@ pub fn capture(spec: Spec, cancel: Cancel) -> Result<Capture, ToolError> {
     unix::capture(spec, cancel)
 }
 
-/// On Windows: through pipes, under the program's Job Object ([`piped`]).
-#[cfg(windows)]
+/// Elsewhere through pipes ([`piped`]), under the program's Job Object (Windows) or process group.
+/// Windows has no terminal to render into; on FreeBSD the kernel discards terminal output the
+/// reader has not read yet when the program (the session leader) exits, so a short program's
+/// output was lost under a terminal, while a pipe keeps it until it is read.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn capture(spec: Spec, cancel: Cancel) -> Result<Capture, ToolError> {
     piped::capture(spec, cancel)
-}
-
-/// Elsewhere capture is unavailable: on FreeBSD the kernel discards output the reader has not
-/// read yet when the program (the session leader) exits, so a short program's output was lost.
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-pub fn capture(_spec: Spec, _cancel: Cancel) -> Result<Capture, ToolError> {
-    Err(ToolError::new(ErrorCode::FeatureMissing, "Process capture is only available on Linux and macOS.")
-        .with_remediation("Run the capture on a Linux or macOS host."))
 }
 
 /// Run a program that crashes without a real console (it asks the console for its size, which
 /// fails on [`crate::process`]'s pipes) and return what it drew and its exit code. The deadline
 /// and `cancel` still end it; nothing writes to its input.
+/// Ends the process `$Root` and what it started, and nothing else. Windows keeps a dead parent's
+/// number on its children and reuses numbers, so `taskkill /T` can end a stranger whose parent's
+/// number `$Root` took: here a process counts only if it started after its parent.
+#[cfg(windows)]
+const END_TREE: &str = "$all = Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate; $tree = @{}; \
+    foreach ($p in $all) { if ($p.ProcessId -eq $Root) { $tree[$Root] = $p.CreationDate } }; if ($tree.Count -eq 0) { exit 0 }; \
+    do { $more = $false; foreach ($p in $all) { $id = [int]$p.ProcessId; $parent = [int]$p.ParentProcessId; \
+    if (-not $tree.ContainsKey($id) -and $tree.ContainsKey($parent) -and $p.CreationDate -ge $tree[$parent]) { $tree[$id] = $p.CreationDate; $more = $true } } } while ($more); \
+    Stop-Process -Id @($tree.Keys) -Force -ErrorAction SilentlyContinue; \
+    $left = @($tree.Keys | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }); \
+    if ($left.Count -gt 0) { Write-Output ('still running: ' + ($left -join ', ')); exit 1 }";
+
 #[cfg(windows)]
 pub fn console_text(program: &std::path::Path, args: &[OsString], timeout: Duration, cancel: Option<Cancel>) -> Result<(String, Option<i32>), ToolError> {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -339,12 +346,15 @@ pub fn console_text(program: &std::path::Path, args: &[OsString], timeout: Durat
     const ROWS: u16 = 50;
     const COLS: u16 = 200;
     let failed = |e: &dyn std::fmt::Display| ToolError::new(ErrorCode::ProgramFailed, format!("{}: {e}", program.display()));
-    let portable_pty::PtyPair { master, slave } =
-        native_pty_system().openpty(PtySize { rows: ROWS, cols: COLS, pixel_width: 0, pixel_height: 0 }).map_err(|e| failed(&e))?;
-    let mut cmd = CommandBuilder::new(program.as_os_str());
-    cmd.args(args);
-    let mut child = slave.spawn_command(cmd).map_err(|e| failed(&e))?;
-    drop(slave);
+    let (master, mut child) = {
+        // A program another thread started while the console opened would hold it open.
+        let _starting = crate::process::STARTING.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let portable_pty::PtyPair { master, slave } =
+            native_pty_system().openpty(PtySize { rows: ROWS, cols: COLS, pixel_width: 0, pixel_height: 0 }).map_err(|e| failed(&e))?;
+        let mut cmd = CommandBuilder::new(program.as_os_str());
+        cmd.args(args);
+        (master, slave.spawn_command(cmd).map_err(|e| failed(&e))?)
+    };
     let mut reader = master.try_clone_reader().map_err(|e| failed(&e))?;
     let mut writer = master.take_writer().map_err(|e| failed(&e))?;
     // The console asks where the cursor is and starts nothing until it's told.
@@ -384,6 +394,20 @@ pub fn console_text(program: &std::path::Path, args: &[OsString], timeout: Durat
         std::thread::sleep(Duration::from_millis(50));
     };
     if stopped.is_err() {
+        // Windows Server 2022's console host can hang closing a console that programs are still
+        // attached to, and they then keep running: end everything the program started first.
+        if let Some(pid) = child.process_id() {
+            let script = format!("$Root = {pid}; {END_TREE}");
+            match crate::process::Process::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()])
+                .timeout(Duration::from_secs(10))
+                .run()
+            {
+                Ok(out) if out.success => {}
+                Ok(out) => log::warn!("couldn't end everything {} started: {}", program.display(), out.stdout_text().trim()),
+                Err(e) => log::warn!("couldn't end what {} started: {}", program.display(), e.message),
+            }
+        }
         let _ = child.kill();
     } else {
         // The console sends what the program drew a moment after it exits, and closing it first
@@ -418,13 +442,36 @@ pub fn console_text(program: &std::path::Path, args: &[OsString], timeout: Durat
 mod console_tests {
     use super::*;
 
+    /// Runs `f` while this process starts other programs, as the app and other tests do. On
+    /// Windows Server 2022 a program started while a console opens inherits handles that keep the
+    /// console open until the program ends. Six programs at most, ended afterwards.
+    fn while_other_programs_start<R>(f: impl FnOnce() -> R) -> R {
+        let comspec = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
+        let starter = std::thread::spawn(move || {
+            (0..6)
+                .filter_map(|_| {
+                    let p = crate::process::Process::new(&comspec).args(["/c", "ping -n 12 127.0.0.1 >nul"]).timeout(Duration::from_secs(20)).spawn().ok();
+                    std::thread::sleep(Duration::from_millis(3));
+                    p
+                })
+                .collect::<Vec<_>>()
+        });
+        let r = f();
+        let started = starter.join().unwrap_or_default();
+        assert_eq!(started.len(), 6, "the other programs didn't start");
+        drop(started);
+        r
+    }
+
     #[test]
     fn reads_what_the_program_drew_and_stops_at_the_deadline() {
         let cmd = PathBuf::from(std::env::var_os("ComSpec").unwrap());
         let echo: Vec<OsString> = ["/c", "echo hello-console & exit 3"].map(OsString::from).to_vec();
-        let (text, code) = console_text(&cmd, &echo, Duration::from_secs(30), None).unwrap();
+        let start = std::time::Instant::now();
+        let (text, code) = while_other_programs_start(|| console_text(&cmd, &echo, Duration::from_secs(30), None)).unwrap();
         assert!(text.contains("hello-console"), "{text:?}");
         assert_eq!(code, Some(3));
+        assert!(start.elapsed() < Duration::from_secs(5), "waited {:?} for a console another program held open", start.elapsed());
         let hang: Vec<OsString> = ["/c", "ping -n 60 127.0.0.1"].map(OsString::from).to_vec();
         assert_eq!(console_text(&cmd, &hang, Duration::from_millis(300), None).unwrap_err().code, ErrorCode::TimedOut);
     }
@@ -438,26 +485,39 @@ mod console_tests {
         std::fs::write(dir.path().join("main.cmd"), "@echo off\r\nstart /b cmd /c \"%~dp0tick.cmd\"\r\nping -n 60 127.0.0.1 >nul\r\n").unwrap();
         let cmd = PathBuf::from(std::env::var_os("ComSpec").unwrap());
         let run = vec![OsString::from("/c"), dir.path().join("main.cmd").into_os_string()];
-        let e = console_text(&cmd, &run, Duration::from_secs(4), None).unwrap_err();
-        assert_eq!(e.code, ErrorCode::TimedOut);
-        assert!(ticks.is_file(), "the second program never ran");
-        std::thread::sleep(Duration::from_secs(2));
-        let before = std::fs::metadata(&ticks).unwrap().len();
-        std::thread::sleep(Duration::from_secs(4));
-        assert_eq!(std::fs::metadata(&ticks).unwrap().len(), before, "the second program is still running");
+        while_other_programs_start(|| {
+            let e = console_text(&cmd, &run, Duration::from_secs(4), None).unwrap_err();
+            assert_eq!(e.code, ErrorCode::TimedOut);
+            assert!(ticks.is_file(), "the second program never ran");
+            std::thread::sleep(Duration::from_secs(2));
+            let before = std::fs::metadata(&ticks).unwrap().len();
+            std::thread::sleep(Duration::from_secs(4));
+            assert_eq!(std::fs::metadata(&ticks).unwrap().len(), before, "the second program is still running");
+        });
     }
 }
 
-/// A capture without a terminal: the program's output read through pipes. Its Job Object ends
-/// every process it started when the run ends, times out or is cancelled.
-#[cfg(any(windows, test))]
+/// A capture without a terminal: the program's output read through pipes. Its Job Object
+/// (Windows) or process group ends every process it started when the run ends, times out or is
+/// cancelled.
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
 mod piped {
     use super::*;
     use crate::process::Process;
     use serde_json::Value;
 
     /// Why a capture on this host has no terminal, recorded with every result.
+    #[cfg(windows)]
     pub const NO_TERMINAL: &str = "There's no terminal capture on Windows: the output was read through pipes, so a program that draws a full-screen terminal interface or colours its output looks different, and its error output follows its normal output instead of being interleaved.";
+    #[cfg(not(windows))]
+    pub const NO_TERMINAL: &str = "There's no terminal capture on this system, whose terminal loses what a short program wrote when it exits: the output was read through pipes, so a program that draws a full-screen terminal interface or colours its output looks different, and its error output follows its normal output instead of being interleaved.";
+
+    /// How everything the program started was ended, recorded with every result.
+    #[cfg(windows)]
+    const ENDED: (&str, &str) = ("job_object", "Every process the program started was ended with its Job Object, which the system empties when the run ends.");
+    #[cfg(not(windows))]
+    const ENDED: (&str, &str) =
+        ("process_group", "Every process the program started in its process group was ended with it when the run ended, timed out or was cancelled.");
 
     pub fn capture(spec: Spec, cancel: Cancel) -> Result<Capture, ToolError> {
         if !spec.events.is_empty() || !spec.observation_paths.is_empty() {
@@ -532,10 +592,7 @@ mod piped {
             cleanup: Cleanup { process_group: "verified".into(), temporary_root: "none" },
             limitations: vec![
                 Limitation { code: "no_terminal".into(), message: NO_TERMINAL.into() },
-                Limitation {
-                    code: "job_object".into(),
-                    message: "Every process the program started was ended with its Job Object, which the system empties when the run ends.".into(),
-                },
+                Limitation { code: ENDED.0.into(), message: ENDED.1.into() },
             ],
             still_unknown: Vec::new(),
             truncated,
@@ -562,6 +619,33 @@ mod piped {
             assert_eq!(screen("a\r\nb  \r\nhalf\rdone\n\n\n", 24), ["a", "b", "done"]);
             assert_eq!(screen("1\n2\n3\n4\n", 2), ["3", "4"]);
             assert!(screen("", 24).is_empty());
+        }
+
+        /// FreeBSD captures this way: a short program's output and exit code, all of them, and
+        /// the process-group limitation rather than the Job Object one.
+        #[cfg(unix)]
+        #[test]
+        fn a_unix_program_is_captured_through_pipes() {
+            let spec = Spec {
+                executable: "/bin/sh".into(),
+                args: ["-c", "echo $CRAFT_TEST_WORD; exit 3"].iter().map(Into::into).collect(),
+                cwd: None,
+                env: vec![("CRAFT_TEST_WORD".into(), "first".into())],
+                terminal: Terminal::default(),
+                events: Vec::new(),
+                timeout: Duration::from_secs(10),
+                idle_timeout: Duration::from_secs(10),
+                settle: Duration::ZERO,
+                finalization: Duration::ZERO,
+                observation_paths: Vec::new(),
+                limits: Limits::default(),
+                sandbox: SandboxRequest::Off,
+            };
+            let c = capture(spec, std::sync::Arc::new(|| false)).unwrap();
+            assert_eq!((c.exit.reason.as_str(), c.exit.code), ("exited", Some(3)));
+            assert_eq!(c.terminal.lines, ["first"]);
+            assert_eq!(c.manifest.pty_backend, "pipes");
+            assert!(c.limitations.iter().any(|l| l.code == "process_group"), "{:?}", c.limitations);
         }
 
         #[test]
@@ -833,7 +917,11 @@ mod unix {
 
         let pty = native_pty_system();
         let size = PtySize { rows: spec.terminal.rows, cols: spec.terminal.cols, pixel_width: 0, pixel_height: 0 };
-        let pair = pty.openpty(size).map_err(|e| to_err("opening a pseudo-terminal", e))?;
+        let pair = {
+            // A program another thread started while the terminal opened would hold it open.
+            let _starting = crate::process::STARTING.write().unwrap_or_else(PoisonError::into_inner);
+            pty.openpty(size).map_err(|e| to_err("opening a pseudo-terminal", e))?
+        };
 
         let mut cmd = CommandBuilder::new(&program);
         for a in &pre_args {
@@ -855,7 +943,11 @@ mod unix {
         cmd.env("TERM", "xterm-256color");
 
         let portable_pty::PtyPair { master, slave } = pair;
-        let mut child = slave.spawn_command(cmd).map_err(|e| to_err("starting the program", e))?;
+        let mut child = {
+            // Started like any other program, so it can't inherit a terminal another capture is opening.
+            let _starting = crate::process::STARTING.read().unwrap_or_else(PoisonError::into_inner);
+            slave.spawn_command(cmd).map_err(|e| to_err("starting the program", e))?
+        };
         // Drop the slave so the reader sees EOF when the child and our writer are gone.
         drop(slave);
         let leader_pid = child.process_id();

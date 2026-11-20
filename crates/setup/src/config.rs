@@ -82,15 +82,29 @@ pub fn remove_entry(client: &Client, text: &str) -> Result<Option<String>, Strin
             let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| e.to_string())?;
             let table = client.table.first().copied().unwrap_or("mcp_servers");
             let removed = doc.get_mut(table).and_then(|t| t.as_table_like_mut()).and_then(|t| t.remove(SERVER_NAME)).is_some();
-            Ok(removed.then(|| doc.to_string()))
+            Ok(removed.then(|| with_line_endings_of(text, doc.to_string())))
         }
         Format::Yaml => {
             let table = client.table.first().copied().unwrap_or("mcp_servers");
-            yaml::parse(text)?;
-            Ok(yaml::remove(text, table, SERVER_NAME))
+            yaml::try_remove(text, table, SERVER_NAME)
         }
         Format::Manual => Ok(None),
     }
+}
+
+/// `edited` with Windows line endings when every line of `original` had them. toml_edit writes its
+/// own line breaks as `\n`; a CRLF file keeps its endings, as the JSONC and YAML edits do.
+///
+/// A file with any bare `\n` is left as toml_edit wrote it: a line break inside a multi-line string
+/// is part of the value. The swap is also dropped if it would change a value we wrote.
+fn with_line_endings_of(original: &str, edited: String) -> String {
+    let crlf = original.matches("\r\n").count();
+    if crlf == 0 || crlf != original.matches('\n').count() {
+        return edited;
+    }
+    let converted = edited.replace("\r\n", "\n").replace('\n', "\r\n");
+    let read = |t: &str| toml::from_str::<toml::Table>(t).ok();
+    if read(&converted) == read(&edited) { converted } else { edited }
 }
 
 fn json_to_toml(v: &Value) -> Option<toml_edit::Value> {
@@ -156,24 +170,28 @@ fn toml_set(client: &Client, text: &str, entry: &Value) -> Result<String, String
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| e.to_string())?;
     let table_name = client.table.first().copied().unwrap_or("mcp_servers");
     let Value::Object(fields) = entry else { return Err("entry must be a table".into()) };
-    let mut ours = toml_edit::Table::new();
-    for (k, v) in fields {
-        let tv = json_to_toml(v).ok_or_else(|| format!("cannot write {k} as TOML"))?;
-        ours.insert(k, toml_edit::Item::Value(tv));
-    }
     if doc.get(table_name).is_none() {
         let mut t = toml_edit::Table::new();
         t.set_implicit(true);
         doc.insert(table_name, toml_edit::Item::Table(t));
     }
-    let servers = doc.get_mut(table_name).and_then(|t| t.as_table_mut()).ok_or_else(|| format!("`{table_name}` exists but is not a table"))?;
+    let inline_parent = doc.get(table_name).is_some_and(toml_edit::Item::is_inline_table);
+    let servers = doc.get_mut(table_name).and_then(|t| t.as_table_like_mut()).ok_or_else(|| format!("`{table_name}` exists but is not a table"))?;
     // Only our own entry is merged into (a foreign one, such as an HTTP `url` Codex would refuse
     // beside a `command`, is replaced, as the plan says it will be). The person's other settings
-    // and comments stay, whether the entry is a table or written inline.
+    // and comments stay, whether the entry or its parent table is written inline.
     let merge = client.shape == Shape::Codex && old.as_ref().is_some_and(is_owned_entry);
     if merge && let Some(existing) = servers.get_mut(SERVER_NAME).and_then(|i| i.as_table_like_mut()) {
         merge_in_place(existing, fields)?;
+    } else if inline_parent {
+        let inline = json_to_toml(entry).ok_or_else(|| "cannot write entry as TOML".to_string())?;
+        servers.insert(SERVER_NAME, toml_edit::Item::Value(inline));
     } else {
+        let mut ours = toml_edit::Table::new();
+        for (k, v) in fields {
+            let tv = json_to_toml(v).ok_or_else(|| format!("cannot write {k} as TOML"))?;
+            ours.insert(k, toml_edit::Item::Value(tv));
+        }
         match servers.get_mut(SERVER_NAME).and_then(|i| i.as_table_mut()) {
             Some(existing) => {
                 // Keep the existing table's position and decor; replace its keys.
@@ -192,7 +210,7 @@ fn toml_set(client: &Client, text: &str, entry: &Value) -> Result<String, String
     {
         arr.retain(|v| v.as_str() != Some(SERVER_NAME));
     }
-    Ok(doc.to_string())
+    Ok(with_line_endings_of(text, doc.to_string()))
 }
 
 #[cfg(test)]

@@ -1,15 +1,20 @@
 //! Property lists: binary (`bplist00`) and XML, parsed into one [`Value`] tree and projected to
-//! normalised JSON. Bounded: object counts, nesting depth and total nodes are capped; shared
-//! references in binary plists are expanded at most once per path (cycles are refused).
+//! normalised JSON. Bounded: object counts, nesting depth, total nodes and copied data and text
+//! are capped; shared references in binary plists are expanded at most once per path (cycles are
+//! refused).
 
 use crate::FormatError;
-use crate::bytes::Reader;
 use serde_json::{Map, Value as Json, json};
 
 /// Deepest nesting accepted.
 pub const MAX_DEPTH: usize = 256;
 /// Most nodes produced by one parse (guards against reference blow-up in binary plists).
 pub const MAX_NODES: usize = 2_000_000;
+/// Most data and decoded text bytes one binary plist may produce, unless three times the file size
+/// is more (damaged text decodes to at most three bytes per stored byte, so a file whose objects
+/// are each used once always fits). A shared object is copied once per reference, so repeats spend
+/// this budget.
+pub const MAX_EXPANDED_BYTES: usize = 64 << 20;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -112,34 +117,33 @@ pub fn int_json(i: i128) -> Json {
 }
 
 /// Standard base64 with padding.
-pub fn base64(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3).saturating_mul(4));
-    for chunk in data.chunks(3) {
-        let b0 = u32::from(chunk.first().copied().unwrap_or(0));
-        let b1 = u32::from(chunk.get(1).copied().unwrap_or(0));
-        let b2 = u32::from(chunk.get(2).copied().unwrap_or(0));
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        let ch = |i: u32| T.get(((n >> i) & 63) as usize).copied().map(char::from).unwrap_or('A');
-        out.push(ch(18));
-        out.push(ch(12));
-        out.push(if chunk.len() > 1 { ch(6) } else { '=' });
-        out.push(if chunk.len() > 2 { ch(0) } else { '=' });
-    }
-    out
-}
+pub use craft_mime::transfer::base64;
 
 /// Decode base64, ignoring whitespace; `None` on invalid characters.
 pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
     crate::bytes::decode_base64(text, false)
 }
 
-/// An Apple absolute time (seconds since 2001-01-01Z) as ISO-8601 UTC.
+/// Maximum absolute Apple-epoch seconds (`1e13`, ~317,000 years from 2001) formatted as ISO-8601.
+/// Fits losslessly inside `f64`'s 53-bit integer significand; larger magnitudes stay raw numbers.
+const MAX_APPLE_DATE_SECS: i128 = 10_000_000_000_000;
+
+/// An Apple absolute time (seconds since 2001-01-01Z) as ISO-8601 UTC, rounded to microseconds.
 pub fn apple_date_iso(secs: f64) -> String {
-    if !secs.is_finite() || secs.abs() > 1e13 {
+    if !secs.is_finite() || secs.abs() > MAX_APPLE_DATE_SECS as f64 {
         return format!("{secs}");
     }
-    let unix = secs.floor() as i64 + 978_307_200;
+    // Separate the fraction before adding the epoch offset, which would otherwise lose
+    // precision for small intervals. Microseconds avoid displaying the floating-point noise
+    // of contemporary dates as nanosecond precision. Floor keeps pre-epoch fractions in the
+    // preceding second.
+    let whole = secs.floor();
+    let mut micros = ((secs - whole) * 1_000_000.0).round() as u32;
+    let mut unix = whole as i64 + 978_307_200;
+    if micros == 1_000_000 {
+        unix += 1;
+        micros = 0;
+    }
     let days = unix.div_euclid(86_400);
     let rem = unix.rem_euclid(86_400);
     // Civil date from days since 1970-01-01.
@@ -153,12 +157,31 @@ pub fn apple_date_iso(secs: f64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+    let fraction = if micros == 0 { String::new() } else { format!(".{micros:06}").trim_end_matches('0').to_string() };
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}{fraction}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// Format an integer Apple absolute time using [`apple_date_iso`] within [`MAX_APPLE_DATE_SECS`],
+/// falling back to the exact decimal string when outside that range.
+pub(crate) fn apple_date_int_iso(secs: i128) -> String {
+    if secs.unsigned_abs() <= MAX_APPLE_DATE_SECS as u128 { apple_date_iso(secs as f64) } else { secs.to_string() }
 }
 
 /// True when the bytes look like a property list of either kind.
 pub fn looks_like_plist(data: &[u8]) -> bool {
-    data.starts_with(b"bplist00") || data.iter().take(1024).copied().collect::<Vec<u8>>().windows(6).any(|w| w == b"<plist")
+    if data.len() >= 8 && data.starts_with(b"bplist0") {
+        return true;
+    }
+    let prefix = &data[..data.len().min(1024)];
+    let (body, marker): (&[u8], &[u8]) = if let Some(body) = prefix.strip_prefix(&[0xff, 0xfe]) {
+        (body, b"<\0p\0l\0i\0s\0t\0")
+    } else if let Some(body) = prefix.strip_prefix(&[0xfe, 0xff]) {
+        (body, b"\0<\0p\0l\0i\0s\0t")
+    } else {
+        return prefix.windows(6).any(|w| w == b"<plist");
+    };
+    // XML detection must agree with parse_xml's BOM decoding, including code-unit alignment.
+    body.windows(marker.len()).step_by(2).any(|w| w == marker)
 }
 
 /// Parse a binary or XML property list.
@@ -169,456 +192,73 @@ pub fn parse(data: &[u8]) -> Result<Value, FormatError> {
 // ---------------------------------------------------------------------------------------------
 // Binary
 
-struct Bin<'a> {
-    r: Reader<'a>,
-    offsets: Vec<usize>,
-    ref_size: usize,
-    nodes: usize,
-}
-
-/// Parse a `bplist00` binary property list.
+/// Parse a binary plist with the historical bplist0x version admission policy.
 pub fn parse_binary(data: &[u8]) -> Result<Value, FormatError> {
-    if !data.starts_with(b"bplist") {
-        return Err(FormatError::Malformed("not a binary plist".into()));
-    }
-    let len = data.len();
-    if len < 8 + 32 {
-        return Err(FormatError::Truncated("binary plist trailer".into()));
-    }
-    let r = Reader::new(data);
-    let t = len - 32;
-    let off_size = usize::from(r.u8(t + 6).unwrap_or(0));
-    let ref_size = usize::from(r.u8(t + 7).unwrap_or(0));
-    let num = r.u64_be(t + 8).unwrap_or(0);
-    let top = r.u64_be(t + 16).unwrap_or(0);
-    let table = r.u64_be(t + 24).unwrap_or(0);
-    if !(1..=8).contains(&off_size) || !(1..=8).contains(&ref_size) {
-        return Err(FormatError::Malformed("bad offset or reference size".into()));
-    }
-    let num = usize::try_from(num).map_err(|_| FormatError::Malformed("object count".into()))?;
-    let table = usize::try_from(table).map_err(|_| FormatError::Malformed("offset table".into()))?;
-    if num == 0 || num > len {
-        return Err(FormatError::Malformed(format!("{num} objects in a {len}-byte file")));
-    }
-    let need = num.checked_mul(off_size).and_then(|n| n.checked_add(table)).ok_or_else(|| FormatError::Malformed("offset table".into()))?;
-    if need > t || table < 8 {
-        return Err(FormatError::Truncated("offset table runs past the trailer".into()));
-    }
-    let mut offsets = Vec::with_capacity(num);
-    for i in 0..num {
-        let o = read_be(&r, table + i * off_size, off_size).ok_or_else(|| FormatError::Truncated("offset table".into()))?;
-        let o = usize::try_from(o).map_err(|_| FormatError::Malformed("object offset".into()))?;
-        if o < 8 || o >= table {
-            return Err(FormatError::Malformed(format!("object {i} lies outside the object area")));
-        }
-        offsets.push(o);
-    }
-    let top = usize::try_from(top).map_err(|_| FormatError::Malformed("top object".into()))?;
-    // Object payloads and references must not borrow bytes from the offset table or trailer.
-    let objects = data.get(..table).ok_or_else(|| FormatError::Truncated("object area".into()))?;
-    let mut b = Bin { r: Reader::new(objects), offsets, ref_size, nodes: 0 };
-    let mut stack = Vec::new();
-    b.object(top, &mut stack)
+    parse_binary_within(data, MAX_EXPANDED_BYTES.max(data.len().saturating_mul(3)))
 }
 
-fn read_be(r: &Reader<'_>, off: usize, n: usize) -> Option<u64> {
-    let s = r.slice(off, n)?;
-    Some(s.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b)))
-}
-
-impl Bin<'_> {
-    fn count(&self, at: usize, low: u8) -> Result<(usize, usize), FormatError> {
-        if low != 0xf {
-            return Ok((usize::from(low), at + 1));
-        }
-        let m = self.r.u8(at + 1).ok_or_else(|| FormatError::Truncated("length".into()))?;
-        if m & 0xf0 != 0x10 {
-            return Err(FormatError::Malformed("bad extended length marker".into()));
-        }
-        if m & 0x0f > 3 {
-            return Err(FormatError::Malformed("extended length width exceeds 64 bits".into()));
-        }
-        let n = 1usize << (m & 0x0f);
-        let v = read_be(&self.r, at + 2, n).ok_or_else(|| FormatError::Truncated("length".into()))?;
-        let v = usize::try_from(v).map_err(|_| FormatError::Malformed("length".into()))?;
-        Ok((v, at + 2 + n))
-    }
-
-    fn reference(&self, at: usize, i: usize) -> Result<usize, FormatError> {
-        let off = i.checked_mul(self.ref_size).and_then(|x| x.checked_add(at)).ok_or_else(|| FormatError::Malformed("reference".into()))?;
-        let v = read_be(&self.r, off, self.ref_size).ok_or_else(|| FormatError::Truncated("object reference".into()))?;
-        usize::try_from(v).map_err(|_| FormatError::Malformed("reference".into()))
-    }
-
-    fn object(&mut self, idx: usize, stack: &mut Vec<usize>) -> Result<Value, FormatError> {
-        self.nodes += 1;
-        if self.nodes > MAX_NODES {
-            return Err(FormatError::TooLarge(format!("more than {MAX_NODES} plist nodes")));
-        }
-        if stack.len() >= MAX_DEPTH {
-            return Err(FormatError::Malformed("nesting too deep".into()));
-        }
-        if stack.contains(&idx) {
-            return Err(FormatError::Malformed(format!("object {idx} contains itself")));
-        }
-        let at = *self.offsets.get(idx).ok_or_else(|| FormatError::Malformed(format!("reference to missing object {idx}")))?;
-        let m = self.r.u8(at).ok_or_else(|| FormatError::Truncated("object marker".into()))?;
-        let (hi, lo) = (m >> 4, m & 0x0f);
-        let v = match hi {
-            0x0 => match lo {
-                0x0 => Value::Null,
-                0x8 => Value::Bool(false),
-                0x9 => Value::Bool(true),
-                _ => Value::Null,
-            },
-            0x1 => {
-                if lo > 4 {
-                    return Err(FormatError::Malformed("integer width exceeds 128 bits".into()));
-                }
-                let n = 1usize << lo;
-                let bytes = self.r.slice(at + 1, n).ok_or_else(|| FormatError::Truncated("integer".into()))?;
-                let v = match n {
-                    8 => i128::from(i64::from_be_bytes(bytes.try_into().map_err(|_| FormatError::Truncated("integer".into()))?)),
-                    16 => i128::from_be_bytes(bytes.try_into().map_err(|_| FormatError::Truncated("integer".into()))?),
-                    _ => i128::from(bytes.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b))),
-                };
-                Value::Integer(v)
-            }
-            0x2 => {
-                let v = match lo {
-                    2 => self.r.u32_be(at + 1).map(|b| f64::from(f32::from_bits(b))),
-                    3 => self.r.u64_be(at + 1).map(f64::from_bits),
-                    _ => None,
-                };
-                Value::Real(v.ok_or_else(|| FormatError::Truncated("real".into()))?)
-            }
-            0x3 => Value::Date(DateValue::Seconds(self.r.u64_be(at + 1).map(f64::from_bits).ok_or_else(|| FormatError::Truncated("date".into()))?)),
-            0x4 => {
-                let (n, s) = self.count(at, lo)?;
-                Value::Data(self.r.slice(s, n).ok_or_else(|| FormatError::Truncated("data".into()))?.to_vec())
-            }
-            0x5 => {
-                let (n, s) = self.count(at, lo)?;
-                Value::String(String::from_utf8_lossy(self.r.slice(s, n).ok_or_else(|| FormatError::Truncated("string".into()))?).into_owned())
-            }
-            0x6 => {
-                let (n, s) = self.count(at, lo)?;
-                let bytes = self
-                    .r
-                    .slice(s, n.checked_mul(2).ok_or_else(|| FormatError::Malformed("string".into()))?)
-                    .ok_or_else(|| FormatError::Truncated("string".into()))?;
-                let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes(*c)).collect();
-                Value::String(String::from_utf16_lossy(&units))
-            }
-            0x8 => {
-                if lo > 7 {
-                    return Err(FormatError::Malformed("uid width exceeds 64 bits".into()));
-                }
-                let n = usize::from(lo) + 1;
-                Value::Uid(read_be(&self.r, at + 1, n).ok_or_else(|| FormatError::Truncated("uid".into()))?)
-            }
-            0xa | 0xc => {
-                let (n, s) = self.count(at, lo)?;
-                if n > self.offsets.len().saturating_mul(4).max(16) || s.saturating_add(n.saturating_mul(self.ref_size)) > self.r.len() {
-                    return Err(FormatError::Malformed("array larger than the file".into()));
-                }
-                stack.push(idx);
-                let mut out = Vec::with_capacity(n);
-                for i in 0..n {
-                    let child = self.reference(s, i)?;
-                    out.push(self.object(child, stack)?);
-                }
-                stack.pop();
-                Value::Array(out)
-            }
-            0xd => {
-                let (n, s) = self.count(at, lo)?;
-                if s.saturating_add(n.saturating_mul(self.ref_size).saturating_mul(2)) > self.r.len() {
-                    return Err(FormatError::Malformed("dictionary larger than the file".into()));
-                }
-                stack.push(idx);
-                let mut out = Vec::with_capacity(n);
-                for i in 0..n {
-                    let k = self.reference(s, i)?;
-                    let v = self.reference(s, i + n)?;
-                    let key = match self.object(k, stack)? {
-                        Value::String(s) => s,
-                        other => format!("{:?}", other.to_json()),
-                    };
-                    out.push((key, self.object(v, stack)?));
-                }
-                stack.pop();
-                Value::Dict(out)
-            }
-            _ => return Err(FormatError::Malformed(format!("unknown object marker {m:#04x}"))),
-        };
-        Ok(v)
-    }
+/// Preserve the app's input/object, expanded-node, depth and copied-text/data budgets.
+fn parse_binary_within(data: &[u8], byte_budget: usize) -> Result<Value, FormatError> {
+    let limits = craft_plist::Limits {
+        max_input_bytes: data.len(),
+        // The former reader rejected an object count larger than the encoded file.
+        max_objects: data.len(),
+        max_nodes: MAX_NODES,
+        max_depth: MAX_DEPTH,
+        max_expanded_bytes: byte_budget,
+    };
+    let options = craft_plist::BinaryOptions { allow_unknown_minor_version: true };
+    craft_plist::parse_binary_with_options(data, limits, options).map(shared_value).map_err(|error| match error {
+        craft_plist::FormatError::TooLarge(message) if message == "expanded node count" => FormatError::TooLarge(format!("more than {MAX_NODES} plist nodes")),
+        other => shared_error(other),
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
 // XML
 
-#[derive(Debug, Clone, PartialEq)]
-enum Tok {
-    Open(String),
-    Close(String),
-    Empty(String),
-    Text(String),
-}
-
-fn decode_entities(s: &str) -> String {
-    if !s.contains('&') {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(p) = rest.find('&') {
-        out.push_str(rest.get(..p).unwrap_or(""));
-        let after = rest.get(p..).unwrap_or("");
-        let Some(end) = after.find(';').filter(|&e| e <= 12) else {
-            out.push('&');
-            rest = after.get(1..).unwrap_or("");
-            continue;
-        };
-        let ent = after.get(1..end).unwrap_or("");
-        let rep = match ent {
-            "lt" => Some('<'),
-            "gt" => Some('>'),
-            "amp" => Some('&'),
-            "quot" => Some('"'),
-            "apos" => Some('\''),
-            e if e.starts_with("#x") || e.starts_with("#X") => u32::from_str_radix(e.get(2..).unwrap_or(""), 16).ok().and_then(char::from_u32),
-            e if e.starts_with('#') => e.get(1..).and_then(|d| d.parse::<u32>().ok()).and_then(char::from_u32),
-            _ => None,
-        };
-        match rep {
-            Some(c) => {
-                out.push(c);
-                rest = after.get(end + 1..).unwrap_or("");
-            }
-            None => {
-                out.push('&');
-                rest = after.get(1..).unwrap_or("");
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-fn tokenize(text: &str) -> Result<Vec<Tok>, FormatError> {
-    let mut toks = Vec::new();
-    let mut rest = text;
-    while !rest.is_empty() {
-        if toks.len() > MAX_NODES {
-            return Err(FormatError::TooLarge("too many XML tokens".into()));
-        }
-        match rest.find('<') {
-            None => {
-                if !rest.trim().is_empty() {
-                    toks.push(Tok::Text(decode_entities(rest)));
-                }
-                break;
-            }
-            Some(p) => {
-                let t = rest.get(..p).unwrap_or("");
-                if !t.is_empty() {
-                    toks.push(Tok::Text(decode_entities(t)));
-                }
-                rest = rest.get(p..).unwrap_or("");
-            }
-        }
-        if let Some(r) = rest.strip_prefix("<!--") {
-            let e = r.find("-->").ok_or_else(|| FormatError::Truncated("comment".into()))?;
-            rest = r.get(e + 3..).unwrap_or("");
-            continue;
-        }
-        if let Some(r) = rest.strip_prefix("<![CDATA[") {
-            let e = r.find("]]>").ok_or_else(|| FormatError::Truncated("CDATA".into()))?;
-            toks.push(Tok::Text(r.get(..e).unwrap_or("").to_string()));
-            rest = r.get(e + 3..).unwrap_or("");
-            continue;
-        }
-        if rest.starts_with("<?") || rest.starts_with("<!") {
-            let e = rest.find('>').ok_or_else(|| FormatError::Truncated("declaration".into()))?;
-            rest = rest.get(e + 1..).unwrap_or("");
-            continue;
-        }
-        let e = rest.find('>').ok_or_else(|| FormatError::Truncated("tag".into()))?;
-        let inner = rest.get(1..e).unwrap_or("").trim();
-        rest = rest.get(e + 1..).unwrap_or("");
-        if let Some(name) = inner.strip_prefix('/') {
-            toks.push(Tok::Close(name.trim().to_string()));
-        } else if let Some(body) = inner.strip_suffix('/') {
-            toks.push(Tok::Empty(body.split_whitespace().next().unwrap_or("").to_string()));
-        } else {
-            toks.push(Tok::Open(inner.split_whitespace().next().unwrap_or("").to_string()));
-        }
-    }
-    Ok(toks)
-}
-
-struct Xml {
-    toks: Vec<Tok>,
-    pos: usize,
-    nodes: usize,
-}
-
-impl Xml {
-    fn next(&mut self) -> Option<Tok> {
-        let t = self.toks.get(self.pos).cloned();
-        self.pos += 1;
-        t
-    }
-
-    fn peek(&self) -> Option<&Tok> {
-        self.toks.get(self.pos)
-    }
-
-    /// Text up to the closing tag `name`.
-    fn text_until(&mut self, name: &str) -> Result<String, FormatError> {
-        let mut s = String::new();
-        loop {
-            match self.next() {
-                Some(Tok::Text(t)) => s.push_str(&t),
-                Some(Tok::Close(n)) if n == name => return Ok(s),
-                Some(other) => return Err(FormatError::Malformed(format!("unexpected {other:?} inside <{name}>"))),
-                None => return Err(FormatError::Truncated(format!("<{name}> is not closed"))),
-            }
-        }
-    }
-
-    fn skip_text(&mut self) {
-        while matches!(self.peek(), Some(Tok::Text(_))) {
-            self.pos += 1;
-        }
-    }
-
-    fn value(&mut self, depth: usize) -> Result<Value, FormatError> {
-        self.nodes += 1;
-        if depth > MAX_DEPTH || self.nodes > MAX_NODES {
-            return Err(FormatError::TooLarge("plist nesting or size limit".into()));
-        }
-        self.skip_text();
-        match self.next() {
-            Some(Tok::Empty(n)) => Ok(match n.as_str() {
-                "true" => Value::Bool(true),
-                "false" => Value::Bool(false),
-                "dict" => Value::Dict(Vec::new()),
-                "array" => Value::Array(Vec::new()),
-                "string" | "key" => Value::String(String::new()),
-                "data" => Value::Data(Vec::new()),
-                other => return Err(FormatError::Malformed(format!("unexpected <{other}/>"))),
-            }),
-            Some(Tok::Open(n)) => match n.as_str() {
-                "string" => Ok(Value::String(self.text_until("string")?)),
-                "integer" => {
-                    let t = self.text_until("integer")?;
-                    let t = t.trim();
-                    let v = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-                        i128::from_str_radix(h, 16).ok()
-                    } else {
-                        t.parse::<i128>().ok()
-                    };
-                    v.map(Value::Integer).ok_or_else(|| FormatError::Malformed(format!("bad integer {t:?}")))
-                }
-                "real" => {
-                    let t = self.text_until("real")?;
-                    t.trim().parse::<f64>().map(Value::Real).map_err(|_| FormatError::Malformed(format!("bad real {t:?}")))
-                }
-                "date" => Ok(Value::Date(DateValue::Text(self.text_until("date")?.trim().to_string()))),
-                "data" => {
-                    let t = self.text_until("data")?;
-                    base64_decode(&t).map(Value::Data).ok_or_else(|| FormatError::Malformed("bad base64 in <data>".into()))
-                }
-                "true" => {
-                    self.text_until("true")?;
-                    Ok(Value::Bool(true))
-                }
-                "false" => {
-                    self.text_until("false")?;
-                    Ok(Value::Bool(false))
-                }
-                "array" => {
-                    let mut out = Vec::new();
-                    loop {
-                        self.skip_text();
-                        if matches!(self.peek(), Some(Tok::Close(c)) if c == "array") {
-                            self.pos += 1;
-                            return Ok(Value::Array(out));
-                        }
-                        if self.peek().is_none() {
-                            return Err(FormatError::Truncated("<array> is not closed".into()));
-                        }
-                        out.push(self.value(depth + 1)?);
-                    }
-                }
-                "dict" => {
-                    let mut out = Vec::new();
-                    loop {
-                        self.skip_text();
-                        match self.next() {
-                            Some(Tok::Close(c)) if c == "dict" => return Ok(Value::Dict(out)),
-                            Some(Tok::Open(k)) if k == "key" => {
-                                let key = self.text_until("key")?;
-                                let v = self.value(depth + 1)?;
-                                out.push((key, v));
-                            }
-                            Some(Tok::Empty(k)) if k == "key" => {
-                                let v = self.value(depth + 1)?;
-                                out.push((String::new(), v));
-                            }
-                            Some(other) => return Err(FormatError::Malformed(format!("expected <key> in <dict>, found {other:?}"))),
-                            None => return Err(FormatError::Truncated("<dict> is not closed".into())),
-                        }
-                    }
-                }
-                other => Err(FormatError::Malformed(format!("unknown plist element <{other}>"))),
-            },
-            Some(other) => Err(FormatError::Malformed(format!("expected a value, found {other:?}"))),
-            None => Err(FormatError::Truncated("expected a value".into())),
-        }
-    }
-}
-
-/// Decode a UTF-16 XML property list after its byte-order mark into UTF-8 text.
-/// Surrogate pairs join normally; a lone surrogate fails as malformed rather
-/// than turning into replacement characters that tokenize into garbage element
-/// names.
-fn decode_utf16_xml(data: &[u8], big_endian: bool) -> Result<String, FormatError> {
-    let r = Reader::new(data);
-    let mut units = Vec::with_capacity(data.len() / 2);
-    let mut off = 0;
-    while let Some(unit) = if big_endian { r.u16_be(off) } else { r.u16_le(off) } {
-        units.push(unit);
-        off += 2;
-    }
-    String::from_utf16(&units).map_err(|_| FormatError::Malformed("invalid UTF-16 in XML plist".into()))
-}
-
-/// Parse an XML property list.
+/// Parse an XML property list with the shared reader. The app's normalized JSON
+/// projection remains local; the shared tree is moved, not cloned.
 pub fn parse_xml(data: &[u8]) -> Result<Value, FormatError> {
-    // Apple's Core Foundation reader accepts XML plists in UTF-16 as well as
-    // UTF-8: it recognises both byte-order marks. `from_utf8_lossy` turns a
-    // UTF-16 byte stream into NUL-separated text, so the encoding is settled
-    // here, before tokenizing.
-    let text = match data {
-        [0xFF, 0xFE, rest @ ..] => decode_utf16_xml(rest, false)?,
-        [0xFE, 0xFF, rest @ ..] => decode_utf16_xml(rest, true)?,
-        _ => String::from_utf8_lossy(data).into_owned(),
+    let limits = craft_plist::Limits {
+        max_input_bytes: data.len(),
+        max_objects: MAX_NODES,
+        max_nodes: MAX_NODES,
+        max_depth: MAX_DEPTH,
+        // UTF-16 to UTF-8 expansion fits three times the encoded input. The
+        // shared reader also charges decoded leaf/key text against this budget.
+        max_expanded_bytes: MAX_EXPANDED_BYTES.max(data.len().saturating_mul(3)),
     };
-    let toks = tokenize(&text)?;
-    let mut x = Xml { toks, pos: 0, nodes: 0 };
-    x.skip_text();
-    match x.peek() {
-        Some(Tok::Open(n)) if n == "plist" => {
-            x.pos += 1;
-            let v = x.value(0)?;
-            Ok(v)
-        }
-        Some(Tok::Open(_)) | Some(Tok::Empty(_)) => x.value(0),
-        _ => Err(FormatError::Malformed("no <plist> element".into())),
+    // The old tokenizer could append at most two tokens after its MAX_NODES check.
+    craft_plist::parse_xml_with_token_limit(data, limits, craft_plist::XmlOptions::default(), MAX_NODES.saturating_add(2))
+        .map(shared_value)
+        .map_err(shared_error)
+}
+
+fn shared_error(error: craft_plist::FormatError) -> FormatError {
+    match error {
+        craft_plist::FormatError::Malformed(message) => FormatError::Malformed(message),
+        craft_plist::FormatError::Truncated(message) => FormatError::Truncated(message),
+        craft_plist::FormatError::Unsupported(message) => FormatError::Unsupported(message),
+        craft_plist::FormatError::TooLarge(message) => FormatError::TooLarge(message),
+    }
+}
+
+// Recursion is bounded by the shared reader's MAX_DEPTH limit before conversion.
+fn shared_value(value: craft_plist::Value) -> Value {
+    use craft_plist::Value as Shared;
+    match value {
+        Shared::Dict(entries) => Value::Dict(entries.into_iter().map(|(key, value)| (key, shared_value(value))).collect()),
+        Shared::Array(values) => Value::Array(values.into_iter().map(shared_value).collect()),
+        Shared::String(text) => Value::String(text),
+        Shared::Integer(value) => Value::Integer(value),
+        Shared::Real(value) => Value::Real(value),
+        Shared::Bool(value) => Value::Bool(value),
+        Shared::Date(craft_plist::DateValue::Seconds(value)) => Value::Date(DateValue::Seconds(value)),
+        Shared::Date(craft_plist::DateValue::Text(value)) => Value::Date(DateValue::Text(value)),
+        Shared::Data(data) => Value::Data(data),
+        Shared::Uid(value) => Value::Uid(value),
+        Shared::Null => Value::Null,
     }
 }
 
@@ -626,6 +266,82 @@ pub fn parse_xml(data: &[u8]) -> Result<Value, FormatError> {
 mod tests {
     use super::*;
     use craft_anything_testkit::apple as fx;
+
+    #[test]
+    fn shared_xml_keeps_order_dates_and_rejects_nonfinite_reals() {
+        let value = parse_xml(br#"<plist><dict><key>x</key><integer>1</integer><key>x</key><integer>2</integer><key>when</key><date> 2026-01-01T00:00:00Z </date></dict></plist>"#).unwrap();
+        let Value::Dict(entries) = value else { panic!("expected dictionary") };
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0], ("x".into(), Value::Integer(1)));
+        assert_eq!(entries[1], ("x".into(), Value::Integer(2)));
+        assert_eq!(entries[2].1, Value::Date(DateValue::Text("2026-01-01T00:00:00Z".into())));
+        for real in ["NaN", "inf", "-inf", "1e999"] {
+            let xml = format!("<plist><real>{real}</real></plist>");
+            assert!(matches!(parse_xml(xml.as_bytes()), Err(FormatError::Malformed(_))));
+        }
+    }
+
+    #[test]
+    fn shared_xml_preserves_app_depth_allowance() {
+        let xml = format!("{}<string>x</string>{}", "<array>".repeat(80), "</array>".repeat(80));
+        assert!(parse_xml(xml.as_bytes()).is_ok());
+        let deep = format!("{}<string>x</string>{}", "<array>".repeat(MAX_DEPTH + 1), "</array>".repeat(MAX_DEPTH + 1));
+        assert!(matches!(parse_xml(deep.as_bytes()), Err(FormatError::TooLarge(_))));
+    }
+
+    #[test]
+    fn xml_has_one_complete_root_with_only_markup_space_around_values() {
+        for invalid in [
+            "<plist><true/>",
+            "<plist><true/></dict>",
+            "<plist><true/><false/></plist>",
+            "<plist><true/></plist><dict/>",
+            "<false/>junk",
+            "text<true/>",
+            "<array>junk<true/></array>",
+            "<dict><key>x</key>garbage<true/></dict>",
+            "<true>no</true>",
+            "<false>yes</false>",
+            "<array><key/></array>",
+        ] {
+            assert!(parse_xml(invalid.as_bytes()).is_err(), "{invalid}");
+        }
+        let xml = b"<?example content > <false/> ?>\n<plist><dict><key/><string>  </string></dict></plist><!-- end -->";
+        assert_eq!(parse_xml(xml).unwrap().get("").and_then(Value::as_str), Some("  "));
+        assert_eq!(parse_xml(b" <true></true> ").unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn xml_rejects_partial_code_units_and_preserves_the_utf8_bom() {
+        assert_eq!(parse_xml(b"\xef\xbb\xbf<string>ok</string>").unwrap().as_str(), Some("ok"));
+        assert!(parse_xml(b"<string>\xff</string>").is_err());
+        for be in [false, true] {
+            let mut bytes = if be { vec![0xfe, 0xff] } else { vec![0xff, 0xfe] };
+            for unit in "<true/>".encode_utf16() {
+                bytes.extend(if be { unit.to_be_bytes() } else { unit.to_le_bytes() });
+            }
+            bytes.push(0);
+            assert!(parse_xml(&bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn a_doctype_internal_subset_is_skipped_as_one_declaration() {
+        let doc = br#"<!DOCTYPE plist [<!ELEMENT plist (string)><!ENTITY text "x]>y"><!-- ]> --><?note ]> ?>]><plist><string>ok</string></plist>"#;
+        assert_eq!(parse_xml(doc).unwrap().as_str(), Some("ok"));
+        assert!(parse_xml(b"<!DOCTYPE plist [<!ELEMENT plist ANY><plist><true/></plist>").is_err());
+    }
+
+    #[test]
+    fn xml_char_refs_require_plain_digits() {
+        let text = |s: &str| {
+            let doc = format!("<plist version=\"1.0\"><string>{s}</string></plist>");
+            parse_xml(doc.as_bytes()).unwrap().as_str().map(str::to_string)
+        };
+        assert_eq!(text("a&#+65;b&#x+41;").as_deref(), Some("a&#+65;b&#x+41;"));
+        assert_eq!(text("&#65;&#x41;").as_deref(), Some("AA"));
+        assert_eq!(text("&#;&#x;").as_deref(), Some("&#;&#x;"));
+    }
 
     #[test]
     fn xml_and_binary_agree() {
@@ -644,6 +360,20 @@ mod tests {
         assert_eq!(j["Flag"], true);
         assert_eq!(j["Pi"], 3.5);
         assert_eq!(j["When"]["$date"], "2001-01-02T00:00:00Z");
+    }
+
+    #[test]
+    fn base64_standard_padding_and_unwrapped_binary() {
+        for (raw, encoded) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy")] {
+            assert_eq!(base64(raw.as_bytes()), encoded);
+        }
+        assert_eq!(base64(&[0xfb, 0xff, 0xff]), "+///");
+        let bytes: Vec<u8> = (0..=255).collect();
+        let encoded = base64(&bytes);
+        assert_eq!(encoded.len(), 344);
+        assert!(!encoded.contains(['\r', '\n']));
+        assert_eq!(base64_decode(&encoded).unwrap(), bytes);
+        assert!(base64_decode("Zm!9v").is_none());
     }
 
     #[test]
@@ -701,6 +431,118 @@ mod tests {
         for data in [&le[..], &be[..]] {
             let v = parse(data).unwrap_or_else(|e| panic!("UTF-16 XML plist should parse: {e}"));
             assert_eq!(v.get("Message").and_then(Value::as_str), Some("hello"));
+        }
+    }
+
+    /// A binary plist of `objects` with two-byte offsets and one-byte references; object 0 is the top.
+    fn small_bplist(objects: &[Vec<u8>]) -> Vec<u8> {
+        let mut b = b"bplist00".to_vec();
+        let mut offsets = Vec::new();
+        for o in objects {
+            offsets.extend_from_slice(&(b.len() as u16).to_be_bytes());
+            b.extend_from_slice(o);
+        }
+        let table = b.len();
+        b.extend(offsets);
+        b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 2, 1]);
+        b.extend_from_slice(&(objects.len() as u64).to_be_bytes());
+        b.extend_from_slice(&0u64.to_be_bytes());
+        b.extend_from_slice(&(table as u64).to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn binary_plist_does_not_invent_types_or_dictionary_keys() {
+        let mut version = small_bplist(&[vec![0x00]]);
+        version[7] = b'1';
+        assert!(looks_like_plist(&version));
+        assert_eq!(parse_binary(&version).unwrap(), Value::Null);
+        version[6] = b'1';
+        assert!(matches!(parse_binary(&version), Err(FormatError::Unsupported(_))));
+        for marker in [0x01, 0x0f, 0x30, 0x32, 0x34] {
+            let mut object = vec![marker];
+            object.extend_from_slice(&0f64.to_be_bytes());
+            assert!(parse_binary(&small_bplist(&[object])).is_err(), "{marker:#x}");
+        }
+        assert_eq!(parse_binary(&small_bplist(&[vec![0x00]])).unwrap(), Value::Null);
+        assert!(parse_binary(&small_bplist(&[vec![0xd1, 1, 2], vec![0x10, 1], vec![0x09]])).is_err());
+        assert_eq!(parse_binary(&small_bplist(&[vec![0xd1, 1, 2], vec![0x51, b'1'], vec![0x09]])).unwrap().get("1"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn binary_minor_compatibility_keeps_leaf_types_and_budget() {
+        for minor in [b'0', b'1', b'9', 0xff] {
+            let mut data = small_bplist(&[vec![0x43, 1, 2, 3]]);
+            data[7] = minor;
+            assert_eq!(parse_binary_within(&data, 3).unwrap(), Value::Data(vec![1, 2, 3]));
+            assert!(matches!(parse_binary_within(&data, 2), Err(FormatError::TooLarge(_))));
+            let mut uid = small_bplist(&[vec![0x81, 0xab, 0xcd]]);
+            uid[7] = minor;
+            assert_eq!(parse_binary(&uid).unwrap(), Value::Uid(0xabcd));
+        }
+    }
+
+    /// An array (or set) of `n` references to object `child`.
+    fn repeated(marker: u8, n: u8, child: u8) -> Vec<u8> {
+        let mut o = vec![marker, 0x10, n];
+        o.extend(std::iter::repeat_n(child, usize::from(n)));
+        o
+    }
+
+    /// Writers store equal values once: Python's plistlib writes `[0] * 17` as two objects, an
+    /// array of 17 references to one integer. Sets share the array branch.
+    #[test]
+    fn arrays_may_name_one_stored_value_many_times() {
+        for marker in [0xaf_u8, 0xcf] {
+            let v = parse(&small_bplist(&[repeated(marker, 17, 1), vec![0x10, 0x00]])).unwrap_or_else(|e| panic!("marker {marker:#04x}: {e}"));
+            let items = v.as_array().unwrap();
+            assert_eq!(items.len(), 17);
+            assert!(items.iter().all(|i| i.as_int() == Some(0)));
+        }
+        // Shared arrays three deep would expand to 255^3 values; the node cap still stops them.
+        let nested = small_bplist(&[repeated(0xaf, 255, 1), repeated(0xaf, 255, 2), repeated(0xaf, 255, 3), vec![0x10, 0x00]]);
+        assert!(matches!(parse(&nested), Err(FormatError::TooLarge(_))));
+    }
+
+    /// One stored leaf of about 1 KiB named 16 x 16 times through two shared arrays. Text is
+    /// charged by its decoded size: damaged UTF-8 bytes and lone surrogates become a 3-byte
+    /// U+FFFD, and U+0800 takes 3 bytes from 2 stored ones.
+    #[test]
+    fn repeated_data_and_text_spend_one_byte_budget() {
+        let cases: [(u8, u16, Vec<u8>, usize); 5] = [
+            (0x4f, 1024, vec![7; 1024], 1024),
+            (0x5f, 1024, vec![b'a'; 1024], 1024),
+            (0x5f, 1024, vec![0xff; 1024], 3072),
+            (0x6f, 512, [0x08, 0x00].repeat(512), 1536),
+            (0x6f, 512, [0xd8, 0x00].repeat(512), 1536),
+        ];
+        for (marker, length, payload, decoded) in cases {
+            let mut leaf = vec![marker, 0x11];
+            leaf.extend_from_slice(&length.to_be_bytes());
+            leaf.extend(payload);
+            let b = small_bplist(&[repeated(0xaf, 16, 1), repeated(0xaf, 16, 2), leaf]);
+            let v = parse_binary_within(&b, 256 * decoded).unwrap_or_else(|e| panic!("{marker:#04x}, {decoded}: {e}"));
+            let size = match &v.as_array().unwrap()[0].as_array().unwrap()[0] {
+                Value::Data(d) => d.len(),
+                Value::String(s) => s.len(),
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(size, decoded, "{marker:#04x}");
+            let r = parse_binary_within(&b, 256 * decoded - 1);
+            assert!(matches!(r, Err(FormatError::TooLarge(_))), "{marker:#04x}, {decoded}: {r:?}");
+        }
+    }
+
+    /// The references name a missing object: the length of the list alone refuses it, before any
+    /// child is read or space is reserved for them.
+    #[test]
+    fn containers_past_the_node_budget_are_refused_before_their_children() {
+        for (marker, count) in [(0xaf_u8, MAX_NODES), (0xdf, MAX_NODES / 2)] {
+            let mut top = vec![marker, 0x12];
+            top.extend_from_slice(&(count as u32).to_be_bytes());
+            top.extend(std::iter::repeat_n(9u8, MAX_NODES));
+            let r = parse(&small_bplist(&[top]));
+            assert!(matches!(r, Err(FormatError::TooLarge(_))), "{marker:#04x}: {r:?}");
         }
     }
 }

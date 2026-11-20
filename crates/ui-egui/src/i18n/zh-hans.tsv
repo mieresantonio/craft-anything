@@ -1,5 +1,6 @@
 # zh-hans: original Chinese UI translations. Licensed MIT OR Apache-2.0.
 # UTF-8: English source<TAB>translation. Keep placeholders and escapes intact.
+Default (its own settings)	默认（其自身设置）
 OpenCode default	OpenCode 默认设置
 Model default	模型默认设置
 Thinking depth	思考深度
@@ -304,6 +305,7 @@ Couldn't look through that folder.	无法查看该文件夹。
 Couldn't open it.	无法打开。
 Couldn't open the folder.	无法打开文件夹。
 Couldn't open {}: {}	无法打开 {}：{}
+Couldn't save your settings.	无法保存设置。
 Couldn't start a worker thread: {e}	无法启动工作线程：{e}
 Couldn't start it.	无法启动。
 Coverage unknown	覆盖范围未知
@@ -893,6 +895,7 @@ Read a Unity game's IL2CPP metadata	读取 Unity 游戏的 IL2CPP 元数据
 Read a game's files	读取游戏文件
 Read a project file	读取项目文件
 Read a setting	读取设置
+Read a text file	读取文本文件
 Read an app's screen	读取应用界面
 Read bytes	读取字节
 Read comment	读取注释
@@ -985,6 +988,7 @@ Saved in	保存位置
 Saves space: copies the program and code, and shares dependencies and media with the project. A shared file rewritten in place changes here too.	节省空间：复制程序和代码，与项目共享依赖和媒体文件。共享文件被原位重写时，此处的内容也会改变。
 Say what you want	描述你的需求
 Say what you want first.	请先描述你的需求。
+This applies once you choose something to recreate above.	在上方选择要重现的内容后，此项才会生效。
 Say what you want to make, or drop an app or file on the window to look inside it. Everything runs in Clean room mode unless you switch on Deep.	描述你想制作的内容，或将应用或文件拖到窗口中查看其内部。除非开启深度模式，否则所有操作都在净室模式下进行。
 Screenshot	截图
 Screenshot a page	截取网页图片
@@ -1190,6 +1194,7 @@ Use the projects folder	使用项目文件夹
 Use this	使用此项
 Use {name}	使用 {name}
 Value flow	值流向
+About	关于
 Version	版本
 Waiting	等待中
 Waiting for another build to finish: this one starts next.	等待另一个构建完成：接下来就会开始。
@@ -1365,6 +1370,7 @@ your files there are the app, edited in place	该位置的文件就是应用，�
 {name} builds what you make; answers come from {brain}.	由 {name} 负责构建，{brain} 负责回答。
 {name} can't be attached: a message takes pictures up to 20 MB.	无法附加 {name}:消息中的图片最大为 20 MB。
 {name} can't be attached: it isn't a PNG, JPEG, GIF or WebP picture.	无法附加 {name}:它不是 PNG、JPEG、GIF 或 WebP 图片。
+{name} can't be kept to only reading, so it isn't asked questions. Ask with Claude Code, or with an AI that has an API key.	{name} 无法被限制为只读，因此不会向它提问。请改用 Claude Code，或使用带 API 密钥的 AI 提问。
 {name} is ready	{name} 已就绪
 {name} is ready.	{name} 已就绪。
 {name} isn't available yet in this build.	此版本尚未提供{name}。
@@ -1444,3 +1450,55 @@ Zoom	缩放
 Bring all to front	前置全部窗口
 Drag to give the plan more or less room; double-click to reset	拖动以调整计划占用的空间；双击恢复默认
 Copy the message	复制这条消息
+Copy the version	复制版本号
+Choose what the builder's approvals get	选择如何处理构建助手的审批
+Reading the web	读取网页
+Other commands	其他命令
+Files outside the project	项目以外的文件
+Pushing and publishing	推送和发布
+Deleting outside the project	在项目以外删除
+System changes	系统更改
+Other tools	其他工具
+Allow	允许
+Ask	询问
+Refuse	拒绝
+After /approvals, type a kind and allow, ask, refuse or default, like /approvals publish ask. Kinds: {kinds}.	在 /approvals 后输入一个类别和 allow、ask、refuse 或 default，例如 /approvals publish ask。类别：{kinds}。
+There's no kind called {name}. Kinds: {kinds}.	没有名为 {name} 的类别。类别：{kinds}。
+Approvals	审批
+In this project, {kind}: {choice}.	在这个项目中，{kind}：{choice}。
+Couldn't change the approvals:	无法更改审批：
+What the builder may do without asking you, in this project.	在这个项目中，构建助手无需问你就可以做的事。
+Default follows Auto mode: with it on, what can be undone goes ahead and the rest is refused; with it off, the builder asks.	默认跟随自动模式：开启时，可撤销的操作会执行，其余的会被拒绝；关闭时，构建助手会询问。
+Connecting to {name}… {seconds} s	正在连接 {name}… {seconds} 秒
+Stopped adding {name}.	已停止添加 {name}。
+It isn't there any more, so {program} runs in its place.	它已不在那里，因此改用 {program}。
+Use it	使用它
+
+# Native update checks and verified installation.
+ArtCraft Launcher manages this app's version. Change its version there.	ArtCraft Launcher 管理此应用的版本。请在那里更改版本。
+Check again	再次检查
+Check for Updates	检查更新
+Check for Updates…	检查更新…
+Checking for updates…	正在检查更新…
+Couldn't check for updates: {error}	无法检查更新：{error}
+Downloading and verifying the update…	正在下载并验证更新…
+No installer is available for this platform.	此平台没有可用的安装程序。
+Releases	发行版本
+Save your work and stop running tasks before installing an update.	安装更新前，请保存工作并停止正在运行的任务。
+The update failed: {error}	更新失败：{error}
+The update worker stopped unexpectedly. Try checking again.	更新工作线程意外停止。请重新检查。
+This installation is managed externally. Update it with its package manager or open Releases.	此安装由外部管理。请使用软件包管理器更新，或打开“发行版本”。
+Update and restart	更新并重启
+Update ready. Restarting…	更新已就绪。正在重启…
+Updated to {version}.	已更新至 {version}。
+Use Releases or your package manager to update this installation.	请通过“发行版本”或软件包管理器更新此安装。
+You're up to date.	已是最新版本。
+{version} is available.	{version} 已可用。
+Forget a website sign-in	忘记网站登录
+Sign in to a website	登录网站
+Some shared files could not be hard-linked and were copied instead ({size}).	部分共享文件无法建立硬链接，已改为复制（{size}）。
+This server lists several chat models. Choose one:	此服务器提供多个聊天模型。请选择一个：
+Choose a model	选择模型
+
+# Saved-builder notice: English until native-speaker review.
+The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.	The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.

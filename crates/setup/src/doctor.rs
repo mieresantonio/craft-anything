@@ -65,6 +65,23 @@ pub struct DoctorReport {
     pub checks: Vec<Check>,
 }
 
+/// The copies that are different files. A PATH folder that is a symlink to another one (`/bin` ->
+/// `/usr/bin`) spells the same program twice, and that is not a second copy (#1550).
+fn distinct_programs(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    for path in paths {
+        let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if !seen.contains(&key) {
+            seen.push(key);
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Runs the read-only checks: the CLI binary, each selected app's registration and skills, and,
+/// when asked, the engines and an MCP self-test.
 pub fn doctor(host: &Host, req: &DoctorRequest) -> DoctorReport {
     let mut checks = Vec::new();
 
@@ -77,7 +94,7 @@ pub fn doctor(host: &Host, req: &DoctorRequest) -> DoctorReport {
             Check::new("binary", CheckStatus::Fail, "craft-anything-cli was not found.").fix("Install Craft Anything; the CLI ships next to the desktop app."),
         ),
     }
-    let on_path = craft_anything_platform::which_all("craft-anything-cli");
+    let on_path = distinct_programs(craft_anything_platform::which_all("craft-anything-cli"));
     if on_path.len() > 1 {
         let list: Vec<String> = on_path.iter().map(|p| p.display().to_string()).collect();
         checks.push(
@@ -101,15 +118,15 @@ pub fn doctor(host: &Host, req: &DoctorRequest) -> DoctorReport {
             skill_dirs.push(c.skills_dir.clone());
         }
         let setup_cmd = format!("craft-anything-cli setup --client {}", c.id);
-        let text = match std::fs::read_to_string(&c.config) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        let text = match crate::plan::read_text(&c.config) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
                 let st = if explicit { CheckStatus::Fail } else { CheckStatus::Info };
                 checks.push(Check::new(name, st, format!("{} is installed but not connected.", c.display)).fix(setup_cmd));
                 continue;
             }
             Err(e) => {
-                checks.push(Check::new(name, CheckStatus::Fail, format!("Can't read {}: {e}", c.config.display())).fix("Check the file's permissions."));
+                checks.push(Check::new(name, CheckStatus::Fail, e.reason(&c.config)).fix(e.fix(&c.config, &format!("run {setup_cmd}"))));
                 continue;
             }
         };
@@ -126,7 +143,12 @@ pub fn doctor(host: &Host, req: &DoctorRequest) -> DoctorReport {
             }
             Ok(Some(e)) => {
                 let desired = cli.as_ref().map(|p| c.desired_entry(&[p.display().to_string(), "mcp".into()]));
-                let program_ok = entry_command(&e).and_then(|v| v.into_iter().next()).is_some_and(|p| Path::new(&p).is_file());
+                // The app starts a bare name from PATH, so look for it there (and in the usual
+                // install folders), not in doctor's own folder.
+                let program_ok = entry_command(&e).and_then(|v| v.into_iter().next()).is_some_and(|p| {
+                    let path = Path::new(&p);
+                    if path.components().count() == 1 { craft_anything_platform::which(&p).is_some() } else { path.is_file() }
+                });
                 if config::is_disabled(c, &text) {
                     Check::new(name, CheckStatus::Warn, format!("{} lists Craft Anything as disabled.", c.display)).fix(setup_cmd)
                 } else if config::entry_turned_off(c, &text) {
@@ -284,6 +306,31 @@ pub fn mcp_self_test(program: &str, args: &[String], timeout: Duration) -> Check
 }
 
 #[cfg(test)]
+mod duplicate_copy_tests {
+    use super::*;
+
+    #[test]
+    fn the_same_path_twice_is_one_copy() {
+        let path = PathBuf::from("craft-anything-cli");
+        assert_eq!(distinct_programs(vec![path.clone(), path.clone()]), [path]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_file_reached_through_a_symlinked_folder_is_not_a_second_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("usr-bin");
+        std::fs::create_dir(&real).unwrap();
+        let name = "craft-anything-cli";
+        let program = real.join(name);
+        std::fs::write(&program, "").unwrap();
+        let link = dir.path().join("bin");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(distinct_programs(vec![link.join(name), program.clone()]), [link.join(name)]);
+    }
+}
+
+#[cfg(test)]
 mod engine_check_tests {
     use super::*;
 
@@ -326,8 +373,8 @@ mod engine_check_tests {
         let check = ghidra_java(&c).unwrap();
         assert_eq!(check.status, CheckStatus::Ok);
         assert!(check.message.contains(&set.display().to_string()), "{}", check.message);
-        // engine:java still reports the Java on PATH (here: none, as only configured paths count).
-        assert!(c.iter().any(|x| x.name == "engine:java" && x.status == CheckStatus::Info));
+        // The other Java tools run on it too, so engine:java finds it.
+        assert!(c.iter().any(|x| x.name == "engine:java" && x.status == CheckStatus::Ok), "{c:?}");
 
         // None set: the JAVA_HOME this program has.
         s.engines.ghidra.java_home = None;

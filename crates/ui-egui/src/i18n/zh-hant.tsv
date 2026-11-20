@@ -1,5 +1,6 @@
 # zh-hant: original Chinese UI translations. Licensed MIT OR Apache-2.0.
 # UTF-8: English source<TAB>translation. Keep placeholders and escapes intact.
+Default (its own settings)	預設（其自身設定）
 OpenCode default	OpenCode 預設設定
 Model default	模型預設設定
 Thinking depth	思考深度
@@ -304,6 +305,7 @@ Couldn't look through that folder.	無法檢視該資料夾。
 Couldn't open it.	無法開啟。
 Couldn't open the folder.	無法開啟資料夾。
 Couldn't open {}: {}	無法開啟 {}：{}
+Couldn't save your settings.	無法儲存設定。
 Couldn't start a worker thread: {e}	無法啟動工作執行緒：{e}
 Couldn't start it.	無法啟動。
 Coverage unknown	涵蓋範圍未知
@@ -893,6 +895,7 @@ Read a Unity game's IL2CPP metadata	讀取 Unity 遊戲的 IL2CPP 中繼資料
 Read a game's files	讀取遊戲檔案
 Read a project file	讀取專案檔案
 Read a setting	讀取設定
+Read a text file	讀取文字檔案
 Read an app's screen	讀取應用程式畫面
 Read bytes	讀取位元組
 Read comment	讀取註解
@@ -985,6 +988,7 @@ Saved in	儲存位置
 Saves space: copies the program and code, and shares dependencies and media with the project. A shared file rewritten in place changes here too.	節省空間：複製程式和程式碼，與專案共用相依套件和媒體檔案。共用檔案被直接覆寫時，此處的內容也會改變。
 Say what you want	描述你的需求
 Say what you want first.	請先描述你的需求。
+This applies once you choose something to recreate above.	在上方選擇要重現的內容後，此項才會生效。
 Say what you want to make, or drop an app or file on the window to look inside it. Everything runs in Clean room mode unless you switch on Deep.	描述你想製作的內容，或將應用程式或檔案拖到視窗中查看其內部。除非開啟深度模式，否則所有操作都在淨室模式下進行。
 Screenshot	螢幕截圖
 Screenshot a page	擷取網頁圖片
@@ -1190,6 +1194,7 @@ Use the projects folder	使用專案資料夾
 Use this	使用此項
 Use {name}	使用 {name}
 Value flow	值流向
+About	關於
 Version	版本
 Waiting	等待中
 Waiting for another build to finish: this one starts next.	等待另一個建置完成：接下來就會開始。
@@ -1365,6 +1370,7 @@ your files there are the app, edited in place	該位置的檔案就是應用程�
 {name} builds what you make; answers come from {brain}.	由 {name} 負責建置，{brain} 負責回答。
 {name} can't be attached: a message takes pictures up to 20 MB.	無法附加 {name}:訊息中的圖片最大為 20 MB。
 {name} can't be attached: it isn't a PNG, JPEG, GIF or WebP picture.	無法附加 {name}:它不是 PNG、JPEG、GIF 或 WebP 圖片。
+{name} can't be kept to only reading, so it isn't asked questions. Ask with Claude Code, or with an AI that has an API key.	{name} 無法被限制為唯讀，因此不會向它提問。請改用 Claude Code，或使用帶 API 金鑰的 AI 提問。
 {name} is ready	{name} 已就緒
 {name} is ready.	{name} 已就緒。
 {name} isn't available yet in this build.	此版本尚未提供{name}。
@@ -1444,3 +1450,55 @@ Zoom	縮放
 Bring all to front	將全部視窗移至最前
 Drag to give the plan more or less room; double-click to reset	拖曳以調整計畫佔用的空間；按兩下恢復預設
 Copy the message	複製這則訊息
+Copy the version	複製版本號
+Choose what the builder's approvals get	選擇如何處理建置助手的審核
+Reading the web	讀取網頁
+Other commands	其他指令
+Files outside the project	專案以外的檔案
+Pushing and publishing	推送和發布
+Deleting outside the project	在專案以外刪除
+System changes	系統變更
+Other tools	其他工具
+Allow	允許
+Ask	詢問
+Refuse	拒絕
+After /approvals, type a kind and allow, ask, refuse or default, like /approvals publish ask. Kinds: {kinds}.	在 /approvals 後輸入一個類別和 allow、ask、refuse 或 default，例如 /approvals publish ask。類別：{kinds}。
+There's no kind called {name}. Kinds: {kinds}.	沒有名為 {name} 的類別。類別：{kinds}。
+Approvals	審核
+In this project, {kind}: {choice}.	在這個專案中，{kind}：{choice}。
+Couldn't change the approvals:	無法變更審核：
+What the builder may do without asking you, in this project.	在這個專案中，建置助手不必問你就可以做的事。
+Default follows Auto mode: with it on, what can be undone goes ahead and the rest is refused; with it off, the builder asks.	預設跟隨自動模式：開啟時，可復原的操作會執行，其餘會被拒絕；關閉時，建置助手會詢問。
+Connecting to {name}… {seconds} s	正在連線 {name}… {seconds} 秒
+Stopped adding {name}.	已停止新增 {name}。
+It isn't there any more, so {program} runs in its place.	它已不在那裡，因此改用 {program}。
+Use it	使用它
+
+# Native update checks and verified installation.
+ArtCraft Launcher manages this app's version. Change its version there.	ArtCraft Launcher 管理此應用程式的版本。請在那裡變更版本。
+Check again	再次檢查
+Check for Updates	檢查更新
+Check for Updates…	檢查更新…
+Checking for updates…	正在檢查更新…
+Couldn't check for updates: {error}	無法檢查更新：{error}
+Downloading and verifying the update…	正在下載並驗證更新…
+No installer is available for this platform.	此平台沒有可用的安裝程式。
+Releases	發行版本
+Save your work and stop running tasks before installing an update.	安裝更新前，請儲存工作並停止正在執行的工作。
+The update failed: {error}	更新失敗：{error}
+The update worker stopped unexpectedly. Try checking again.	更新工作執行緒意外停止。請重新檢查。
+This installation is managed externally. Update it with its package manager or open Releases.	此安裝由外部管理。請使用套件管理器更新，或開啟「發行版本」。
+Update and restart	更新並重新啟動
+Update ready. Restarting…	更新已就緒。正在重新啟動…
+Updated to {version}.	已更新至 {version}。
+Use Releases or your package manager to update this installation.	請透過「發行版本」或套件管理器更新此安裝。
+You're up to date.	已是最新版本。
+{version} is available.	{version} 已可用。
+Forget a website sign-in	忘記網站登入
+Sign in to a website	登入網站
+Some shared files could not be hard-linked and were copied instead ({size}).	部分共用檔案無法建立硬連結，已改為複製（{size}）。
+This server lists several chat models. Choose one:	此伺服器提供多個聊天模型。請選擇一個：
+Choose a model	選擇模型
+
+# Saved-builder notice: English until native-speaker review.
+The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.	The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.

@@ -52,6 +52,8 @@ pub fn question_in(text: &str, just_ask: bool) -> Result<Option<String>, String>
     match slash::read(text) {
         Typed::Command(Command::Btw, "") => Err(tr("Type your question after /btw.")),
         Typed::Command(Command::Btw, question) => Ok(Some(question.to_string())),
+        // Not a question: the prompt box hands it to `approvals::command_in` before asking here.
+        Typed::Command(Command::Approvals, _) => Ok(None),
         Typed::Unknown(name) => Err(trf("There's no /{name} command. You can use {commands}.", &[("name", name), ("commands", &slash::names())])),
         Typed::Message => Ok(Some(text.trim()).filter(|t| just_ask && !t.is_empty()).map(str::to_string)),
     }
@@ -107,6 +109,12 @@ impl CraftApp {
                     slot.answer = Some(Ok(answer));
                     slot.reveal = true;
                 }
+                if let (Some(saved), Some(used)) = (a["builder_replacement"]["saved"].as_str(), a["builder_replacement"]["used"].as_str()) {
+                    self.toast(crate::builders::replaced_builder_notice(saved, used), false);
+                } else if let Some(notice) = a["builder_notice"].as_str() {
+                    // Compatibility with responses that predate the structured names.
+                    self.toast(notice.to_string(), false);
+                }
                 if let Some(why) = v["not_kept"].as_str() {
                     self.toast(format!("{} {why}", tr("This answer won't be there after a restart:")), true);
                 }
@@ -141,10 +149,10 @@ pub fn card(ui: &mut Ui, a: &mut Asked, glossary: bool) {
         let mut toggle = false;
         ui.horizontal(|ui| {
             let name = if a.collapsed { "Show the answer" } else { "Hide the answer" };
-            toggle |= icons::button(ui, if a.collapsed { "chevron-right" } else { "chevron-down" }, 22.0, false, name).clicked();
+            toggle |= icons::button(ui, if a.collapsed { "chevron-right" } else { "chevron-down" }, theme::ControlSize::Small, false, name).clicked();
             let (icon, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-            icons::paint(ui, icon, "circle-help", 16.0, t.icon);
-            let line = egui::Label::new(RichText::new(&a.question).strong()).sense(egui::Sense::click()).selectable(false);
+            icons::paint(ui, icon, "circle-help", theme::icon::MD, t.icon);
+            let line = egui::Label::new(RichText::new(&a.question).font(theme::semibold(theme::BODY))).sense(egui::Sense::click()).selectable(false);
             let line = if a.collapsed { line.truncate() } else { line.wrap() };
             toggle |= ui.add(line).on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
         });
@@ -154,12 +162,12 @@ pub fn card(ui: &mut Ui, a: &mut Asked, glossary: bool) {
         if a.collapsed {
             return;
         }
-        ui.add_space(4.0);
+        ui.add_space(theme::space::XS);
         match &a.answer {
             None => widgets::thinking(ui),
             Some(Ok(ans)) => {
                 chat::rich_text(ui, &ans.text, glossary);
-                ui.add_space(4.0);
+                ui.add_space(theme::space::XS);
                 let from = if ans.from_session { tr("from the builder's own memory of the build") } else { tr("from the project's files") };
                 let cost = ans.cost_usd.map(|c| format!(" · ${c:.2}")).unwrap_or_default();
                 ui.label(
@@ -211,6 +219,23 @@ mod tests {
         assert_eq!(out[0].pictures, pics);
         assert_eq!(out[1].text, "/btw where are the files");
         assert!(out[1].pictures.is_empty());
+    }
+
+    #[test]
+    fn a_question_answered_by_a_replacement_says_so() {
+        let mut app = crate::demo::app(crate::demo::engine(craft_anything_engine::Mode::Beginner, true));
+        app.question_done(Ok(serde_json::json!({
+            "project": "/tmp/example",
+            "question": "where?",
+            "answered": {
+                "answer": "In app.",
+                "from": "the_files",
+                "backend": "Claude",
+                "builder_notice": "The AI chosen for this project (Off) is turned off or no longer set up. Claude builds instead."
+            },
+            "not_kept": null
+        })));
+        assert!(app.state.toasts.iter().any(|(t, err)| !*err && t.contains("Off") && t.contains("Claude")), "{:?}", app.state.toasts);
     }
 
     #[test]

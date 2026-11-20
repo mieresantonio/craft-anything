@@ -52,6 +52,9 @@ pub struct Node {
     pub size: u64,
     /// 4 marks a serialized file (the bundle's objects).
     pub flags: u32,
+    /// Whether the checked end of this member fits the complete uncompressed stream.
+    /// Invalid entries are retained for reporting, but their contents must not be read.
+    pub range_valid: bool,
 }
 
 /// A compression's name by its number.
@@ -101,13 +104,20 @@ pub fn header(data: &[u8], file_len: u64) -> Result<Header, FormatError> {
     if format_version >= 7 {
         at = at.div_ceil(16) * 16;
     }
-    let (table_offset, mut data_offset) =
-        if flags & 0x80 != 0 { (file_len.saturating_sub(u64::from(table_size)), at) } else { (at, at + u64::from(table_size)) };
-    if flags & 0x200 != 0 {
-        data_offset = data_offset.div_ceil(16) * 16;
+    let bad_extent = || FormatError::Malformed("the bundle size or block table doesn't fit the file".into());
+    if size < at || size > file_len || table_uncompressed_size > MAX_TABLE {
+        return Err(bad_extent());
     }
-    if table_offset + u64::from(table_size) > file_len || table_uncompressed_size > MAX_TABLE {
-        return Err(FormatError::Malformed("the block table doesn't fit the file".into()));
+    let table_at_end = flags & 0x80 != 0;
+    let table_offset = if table_at_end { size.checked_sub(u64::from(table_size)).ok_or_else(bad_extent)? } else { at };
+    let table_end = table_offset.checked_add(u64::from(table_size)).ok_or_else(bad_extent)?;
+    let mut data_offset = if table_at_end { at } else { table_end };
+    if flags & 0x200 != 0 {
+        data_offset = data_offset.checked_next_multiple_of(16).ok_or_else(bad_extent)?;
+    }
+    let data_end = if table_at_end { table_offset } else { size };
+    if table_offset < at || table_end > size || data_offset > data_end {
+        return Err(bad_extent());
     }
     Ok(Header { format_version, unity_version, unity_revision, size, flags, table_offset, table_size, table_uncompressed_size, data_offset })
 }
@@ -115,22 +125,31 @@ pub fn header(data: &[u8], file_len: u64) -> Result<Header, FormatError> {
 /// Decompress one piece of a bundle with compression `kind` (the low six bits of a flags field).
 pub fn decompress(kind: u32, input: &[u8], out_len: u32) -> Result<Vec<u8>, FormatError> {
     let bad = |e: decompress::DecompressError| FormatError::Malformed(format!("a {} block: {e}", compression_name(kind)));
-    match kind {
+    let bad_size = |actual: usize| FormatError::Malformed(format!("a {} block has {actual} decoded bytes, expected {out_len}", compression_name(kind)));
+    if kind == 0 && input.len() != out_len as usize {
+        return Err(bad_size(input.len()));
+    }
+    let output = match kind {
         0 => Ok(input.to_vec()),
-        // Unity's LZMA is the 5 property bytes and the stream; the `.lzma` form adds the size.
+        // Unity stores the properties and stream without a size header; check its end before trusting out_len.
         1 => {
-            let props = input.get(..5).ok_or_else(|| FormatError::Truncated("LZMA properties".into()))?;
-            let mut alone = props.to_vec();
-            alone.extend_from_slice(&u64::from(out_len).to_le_bytes());
-            alone.extend_from_slice(&input[5..]);
-            decompress::lzma(&alone, u64::from(out_len)).map_err(bad)
+            if input.len() < 5 {
+                return Err(FormatError::Truncated("LZMA properties".into()));
+            }
+            decompress::lzma_raw_complete(input, out_len).map_err(bad)
         }
         2 | 3 => decompress::lz4_block(input, out_len as usize).map_err(bad),
         n => Err(FormatError::Unsupported(format!("compression {n}"))),
+    }?;
+    if output.len() != out_len as usize {
+        return Err(bad_size(output.len()));
     }
+    Ok(output)
 }
 
-/// Read the block table (`table` as stored in the file).
+/// Read the block table (`table` as stored in the file), checking that its compressed blocks
+/// fit the header's data region. Members outside the uncompressed stream are retained with
+/// [`Node::range_valid`] false so a damaged entry does not hide valid siblings.
 pub fn table(table: &[u8], h: &Header) -> Result<(Vec<Block>, Vec<Node>), FormatError> {
     let t = decompress(h.flags & 0x3f, table, h.table_uncompressed_size)?;
     let mut pos = 16; // the data's hash
@@ -141,20 +160,29 @@ pub fn table(table: &[u8], h: &Header) -> Result<(Vec<Block>, Vec<Node>), Format
         }
         Ok(n)
     };
+    let data_end = if h.flags & 0x80 != 0 { h.table_offset } else { h.size };
+    let bad_blocks = || FormatError::Malformed("the compressed blocks don't fit the bundle's data region".into());
+    let mut remaining = data_end.checked_sub(h.data_offset).ok_or_else(bad_blocks)?;
+    let mut uncompressed_len = 0u64;
     let mut blocks = Vec::new();
     for _ in 0..count(&mut pos, "blocks", 10)? {
         let uncompressed_size = u32::from_be_bytes(be(&t, &mut pos, "block")?);
         let compressed_size = u32::from_be_bytes(be(&t, &mut pos, "block")?);
         let flags = u16::from_be_bytes(be(&t, &mut pos, "block")?);
+        remaining = remaining.checked_sub(u64::from(compressed_size)).ok_or_else(bad_blocks)?;
+        uncompressed_len = uncompressed_len
+            .checked_add(u64::from(uncompressed_size))
+            .ok_or_else(|| FormatError::Malformed("the uncompressed bundle size overflows".into()))?;
         blocks.push(Block { uncompressed_size, compressed_size, flags });
     }
     let mut nodes = Vec::new();
     for _ in 0..count(&mut pos, "nodes", 21)? {
         let offset = u64::from_be_bytes(be(&t, &mut pos, "node")?);
         let size = u64::from_be_bytes(be(&t, &mut pos, "node")?);
+        let range_valid = offset.checked_add(size).is_some_and(|end| end <= uncompressed_len);
         let flags = u32::from_be_bytes(be(&t, &mut pos, "node")?);
         let path = cstr(&t, &mut pos, "node path")?;
-        nodes.push(Node { path, offset, size, flags });
+        nodes.push(Node { path, offset, size, flags, range_valid });
     }
     Ok((blocks, nodes))
 }

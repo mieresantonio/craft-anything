@@ -3,7 +3,7 @@
 //! and dynamic-library resolution inside app bundles. No Apple tooling is needed, so all of it
 //! works on any host.
 
-use super::artifact_tools::{WalkOptions, rel_to, walk_dir};
+use super::artifact_tools::{WalkOptions, rel_to, unlisted_limitation, walk_dir};
 use super::native_common::{page, spec};
 use super::static_input::{self, Input, builder, format_err};
 use crate::target::TargetKind;
@@ -295,8 +295,8 @@ fn bundle_info_plist(dir: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// A bundle's main executable.
-fn bundle_executable(dir: &Path) -> Option<PathBuf> {
+/// A bundle's main executable: the one its Info.plist names, else the one named like the bundle.
+pub fn bundle_executable(dir: &Path) -> Option<PathBuf> {
     let exe_name =
         bundle_info_plist(dir).and_then(|p| read_plist_file(&p)).and_then(|v| v.get("CFBundleExecutable").and_then(plist::Value::as_str).map(str::to_string));
     let stem = dir.file_stem().map(|s| s.to_string_lossy().into_owned());
@@ -502,7 +502,8 @@ fn check_hashes(slice: &[u8], sig_bytes: &[u8], sig: &codesign::Signature, cd: &
     if hs == 0 || hs > 64 || cd.page_size == 0 {
         return json!({"checked": false, "reason": "unsupported hash size or page size"});
     }
-    let base = cd.offset.saturating_add(cd.hash_offset as usize);
+    let base = cd.hash_offset as usize;
+    let cd_bytes = cd.offset.checked_add(cd.length as usize).and_then(|end| sig_bytes.get(cd.offset..end.min(sig_bytes.len()))).unwrap_or_default();
     let page = usize::try_from(cd.page_size).unwrap_or(4096);
     let limit = usize::try_from(cd.code_limit).unwrap_or(usize::MAX).min(slice.len());
     let mut matched = 0u64;
@@ -516,7 +517,8 @@ fn check_hashes(slice: &[u8], sig_bytes: &[u8], sig: &codesign::Signature, cd: &
             continue;
         }
         let end = start.saturating_add(page).min(limit);
-        let (Some(data), Some(stored)) = (slice.get(start..end), sig_bytes.get(base.saturating_add(i * hs)..base.saturating_add(i * hs + hs))) else {
+        let stored = i.checked_mul(hs).and_then(|n| base.checked_add(n)).and_then(|at| cd_bytes.get(at..at.checked_add(hs)?));
+        let (Some(data), Some(stored)) = (slice.get(start..end), stored) else {
             missing += 1;
             continue;
         };
@@ -540,8 +542,11 @@ fn check_hashes(slice: &[u8], sig_bytes: &[u8], sig: &codesign::Signature, cd: &
         if slot > i64::from(cd.special_slots) {
             continue;
         }
-        let stored = sig_bytes.get(base.saturating_sub(slot as usize * hs)..base.saturating_sub(slot as usize * hs).saturating_add(hs));
-        let Some(stored) = stored else { continue };
+        let stored = (slot as usize).checked_mul(hs).and_then(|n| base.checked_sub(n)).and_then(|at| cd_bytes.get(at..at.checked_add(hs)?));
+        let Some(stored) = stored else {
+            special.push(json!({"slot": -slot, "what": what, "status": "not-checked", "stored": null}));
+            continue;
+        };
         let zero = stored.iter().all(|&x| x == 0);
         let actual: Option<Vec<u8>> = match slot {
             2 | 5 | 7 => blob_for(slot as u32).map(<[u8]>::to_vec),
@@ -592,6 +597,7 @@ fn apple_signature_show(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
         ToolError::new(ErrorCode::NotSupported, "the code signature lies outside the file").with_remediation("The file may be truncated; check it is complete.")
     })?;
     let sig = codesign::parse(sig_bytes).map_err(|e| format_err(e, "a code signature"))?;
+    let sig_bytes = sig_bytes.get(..(sig.length as usize).min(sig_bytes.len())).unwrap_or_default();
     let checks: Vec<Value> = sig
         .code_directories
         .iter()
@@ -781,10 +787,13 @@ fn apple_nib_decode(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     let mut storyboards = Vec::new();
     let mut truncated = false;
+    let mut unlisted = Vec::new();
     if root.is_dir() {
         let skip = |_: &str| false;
-        let walked = walk_dir(&root, &WalkOptions { max_files: 50_000, max_depth: 24, skip_dir: &skip, gitignore: false, include_hidden: false }, &ctx.cancel)?;
+        let mut walked =
+            walk_dir(&root, &WalkOptions { max_files: 50_000, max_depth: 24, skip_dir: &skip, gitignore: false, include_hidden: false }, &ctx.cancel)?;
         truncated |= walked.truncated;
+        unlisted = std::mem::take(&mut walked.unlisted);
         for f in &walked.files {
             if is_nib_path(&f.rel) {
                 // A .nib folder holding several variants: keep the first one only.
@@ -860,9 +869,11 @@ fn apple_nib_decode(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     if capped {
         lims.push(Limitation::new(
             "truncated",
-            "A document, object or connection limit (or the folder walk limit) cut the listing short; raise the max_* parameters.",
+            "A document, object or connection limit cut the listing short (raise the max_* parameters), or the folder walk was cut short by its own limits or by entries that couldn't be read.",
         ));
     }
+    // Interface files in a folder that couldn't be listed were never looked for.
+    lims.extend(unlisted_limitation(&unlisted));
     if !failures.is_empty() {
         lims.push(Limitation::new("unreadable_documents", format!("{} document(s) could not be decoded", failures.len())));
     }
@@ -913,13 +924,12 @@ fn apple_archive_decode(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
         ))
     })?;
     let tree = a.project(root);
-    let rows = a.rows();
-    let total = rows.len();
-    let page_rows: Vec<&keyed_archive::ObjectRow> = rows.iter().skip(p.offset).take(p.limit).collect();
-    let mut classes: BTreeMap<String, usize> = BTreeMap::new();
-    for r in &rows {
-        if let Some(c) = &r.class {
-            *classes.entry(c.clone()).or_insert(0) += 1;
+    let total = a.objects.len();
+    let page_rows = a.rows_page(p.offset, p.limit);
+    let mut classes: BTreeMap<&str, usize> = BTreeMap::new();
+    for i in 0..total {
+        if let Some(c) = a.class_name(i as u64) {
+            *classes.entry(c).or_insert(0) += 1;
         }
     }
     let summary = format!(
@@ -927,7 +937,7 @@ fn apple_archive_decode(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
         inp.name,
         if a.archiver.is_empty() { "an unnamed archiver" } else { a.archiver.as_str() },
         total,
-        a.class_of(root).unwrap_or_else(|| "a plain value".into())
+        a.class_name(root).unwrap_or("a plain value")
     );
     let mut b = builder(ctx, "apple_archive_decode", inp.subject.clone(), json!({"path": inp.path, "root": root_name, "offset": p.offset, "limit": p.limit}))
         .result(json!({
@@ -976,6 +986,10 @@ fn apple_assets_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
     let c = car::parse(&inp.bytes).map_err(|e| format_err(e, "an asset catalog"))?;
     let total = c.renditions.len();
     let page_r: Vec<&car::Rendition> = c.renditions.iter().skip(p.offset).take(p.limit).collect();
+    let mut coverage = Coverage::page(page_r.len() as u64, total as u64, p.offset as u64);
+    if c.tree_incomplete {
+        coverage.status = CoverageStatus::Partial;
+    }
     let mut by_format: BTreeMap<String, usize> = BTreeMap::new();
     for r in &c.renditions {
         *by_format.entry(r.pixel_format.clone().unwrap_or_else(|| "unknown".into())).or_insert(0) += 1;
@@ -986,23 +1000,25 @@ fn apple_assets_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
         lims.push(Limitation::new("catalog_warnings", c.warnings.iter().take(20).cloned().collect::<Vec<_>>().join("; ")));
     }
     let summary = format!(
-        "{}: {} facet(s), {} rendition(s){}.",
+        "{}: {} facet(s), {} rendition(s){}.{}",
         inp.name,
         c.facets.len(),
         total,
-        c.header.as_ref().map(|h| format!(", schema {} storage {}", h.schema_version, h.storage_version)).unwrap_or_default()
+        c.header.as_ref().map(|h| format!(", schema {} storage {}", h.schema_version, h.storage_version)).unwrap_or_default(),
+        if c.tree_incomplete { " Some catalog tree entries could not be read." } else { "" }
     );
     let ev = builder(ctx, "apple_assets_list", inp.subject.clone(), json!({"path": inp.path, "offset": p.offset, "limit": p.limit}))
         .result(json!({
             "path": inp.path, "bom": c.bom, "header": c.header, "extended_metadata": c.extended_metadata,
             "key_format": c.key_format, "facets": c.facets, "appearances": c.appearances,
+            "tree_incomplete": c.tree_incomplete,
             "renditions_total": total, "renditions_by_pixel_format": by_format, "renditions": page_r,
         }))
         .summary(summary)
         .confidence(Confidence::Observed)
         .authority(Authority::OriginalFiles)
         .limitations(lims)
-        .coverage(Coverage::page(page_r.len() as u64, total as u64, p.offset as u64))
+        .coverage(coverage)
         .location(loc(&inp))
         .build()?;
     Ok(ToolOutput::evidence(ev))
@@ -1348,8 +1364,21 @@ fn apple_dylibs_resolve(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
         ),
     ];
     if walked.truncated {
-        lims.push(Limitation::new("truncated", "The bundle walk hit its file or depth limit; some programs were not considered."));
+        lims.push(Limitation::new(
+            "truncated",
+            "The bundle walk was cut short by a file, entry or depth limit, or by entries that couldn't be read; some programs were not considered.",
+        ));
     }
+    // Programs in a folder that couldn't be listed were never looked for.
+    lims.extend(unlisted_limitation(&walked.unlisted));
+    // A walk cut by any limit, or by a folder it couldn't list, may have missed a program, so the
+    // trace isn't complete. Partial counts the images whose loading was attempted (`images`, which
+    // records failures too); `loaded` also holds a dependency queued before `max_images` stopped it.
+    let coverage = if !walked.truncated && walked.unlisted.is_empty() {
+        Coverage::complete(t.loaded.len() as u64)
+    } else {
+        Coverage { status: CoverageStatus::Partial, examined: Some(t.images.len() as u64), total: None, next_offset: None }
+    };
     let name = bundle.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let ev = builder(
         ctx,
@@ -1365,7 +1394,7 @@ fn apple_dylibs_resolve(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
     .confidence(Confidence::Derived)
     .authority(Authority::OriginalFiles)
     .limitations(lims)
-    .coverage(Coverage::complete(t.loaded.len() as u64))
+    .coverage(coverage)
     .location(Location::new("path", bundle.display().to_string()))
     .build()?;
     Ok(ToolOutput::evidence(ev))
@@ -1375,6 +1404,7 @@ fn apple_dylibs_resolve(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
 mod tests {
     use super::super::native_common::test_support::{call, call_err, engine_with};
     use crate::Engine;
+    use craft_anything_formats::codesign;
     use craft_anything_testkit::apple as fx;
     use serde_json::json;
 
@@ -1423,6 +1453,118 @@ mod tests {
         let unsigned = engine_with("plain", &craft_anything_testkit::macho64());
         let u = call(&unsigned, "apple_signature_show", json!({}));
         assert_eq!(u["result"]["signed"], false);
+    }
+
+    fn signature_file(signature: &[u8]) -> Vec<u8> {
+        // One load command fits in the fixture's 64-byte header area.
+        let command: Vec<u8> = [0x1du32, 16, 64, signature.len() as u32].into_iter().flat_map(u32::to_le_bytes).collect();
+        let mut bytes = fx::macho_min(fx::CPU_X86_64, 2, &[command], &[]);
+        assert_eq!(bytes.len(), 64);
+        bytes.extend_from_slice(signature);
+        bytes
+    }
+
+    #[test]
+    fn signature_special_slots_ignore_bytes_past_superblob() {
+        let mut signature = fx::code_signature_blob();
+        let parsed = codesign::parse(&signature).unwrap();
+        let entitlements = parsed.blobs.iter().find(|b| b.slot == 5).unwrap();
+        // Retain the child's header, but leave its payload outside the declared signature.
+        signature[4..8].copy_from_slice(&(entitlements.offset + 8).to_be_bytes());
+        let e = engine_with("short-signature", &signature_file(&signature));
+        let r = call(&e, "apple_signature_show", json!({}));
+        assert!(r["result"]["entitlements"].is_null());
+        let special = r["result"]["hash_checks"][0]["result"]["special_slots"].as_array().unwrap();
+        assert_eq!(special.iter().find(|s| s["what"] == "entitlements").unwrap()["status"], "not-checked");
+
+        // The same complete child is still checked when it lies inside the declared extent.
+        signature[4..8].copy_from_slice(&parsed.length.to_be_bytes());
+        let e = engine_with("complete-signature", &signature_file(&signature));
+        let r = call(&e, "apple_signature_show", json!({}));
+        assert_eq!(r["result"]["entitlements"]["com.apple.security.network.client"], true);
+        let special = r["result"]["hash_checks"][0]["result"]["special_slots"].as_array().unwrap();
+        assert_eq!(special.iter().find(|s| s["what"] == "entitlements").unwrap()["status"], "mismatch");
+    }
+
+    #[test]
+    fn signature_stored_hashes_ignore_bytes_past_superblob() {
+        let mut signature = fx::assemble_superblob(&[(0, fx::code_directory_blob())]);
+        let parsed = codesign::parse(&signature).unwrap();
+        let cd = &parsed.code_directories[0];
+        let hash_offset = parsed.length - cd.offset as u32;
+        signature[cd.offset + 16..cd.offset + 20].copy_from_slice(&hash_offset.to_be_bytes());
+        signature[cd.offset + 24..cd.offset + 28].copy_from_slice(&0u32.to_be_bytes());
+        // LC_CODE_SIGNATURE includes these bytes; the superblob does not.
+        signature.extend_from_slice(&[0; 32]);
+        let e = engine_with("external-page-hash", &signature_file(&signature));
+        let r = call(&e, "apple_signature_show", json!({}));
+        let checks = &r["result"]["hash_checks"][0]["result"];
+        assert_eq!(checks["pages_unchecked"], 1);
+        assert_eq!(checks["pages_matched"], 0);
+        assert!(checks["pages_mismatched"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn signature_missing_special_hashes_are_reported() {
+        let mut signature = fx::assemble_superblob(&[(0, fx::code_directory_blob())]);
+        let parsed = codesign::parse(&signature).unwrap();
+        let cd = &parsed.code_directories[0];
+        let special_slots = 7u32;
+        let missing_bytes = special_slots * u32::from(cd.hash_size);
+        let hash_offset = parsed.length - cd.offset as u32 + missing_bytes;
+        signature[cd.offset + 16..cd.offset + 20].copy_from_slice(&hash_offset.to_be_bytes());
+        signature[cd.offset + 24..cd.offset + 28].copy_from_slice(&special_slots.to_be_bytes());
+        signature[cd.offset + 28..cd.offset + 32].copy_from_slice(&0u32.to_be_bytes());
+        // Stored special hashes start at the superblob's end, inside LC_CODE_SIGNATURE only.
+        signature.resize(signature.len() + missing_bytes as usize, 0);
+        let e = engine_with("external-special-hashes", &signature_file(&signature));
+        let r = call(&e, "apple_signature_show", json!({}));
+        let checks = &r["result"]["hash_checks"][0]["result"];
+        assert_eq!(checks["checked"], true);
+        let special = checks["special_slots"].as_array().unwrap();
+        let expected = [(-1, "info-plist"), (-2, "requirements"), (-5, "entitlements"), (-7, "der-entitlements"), (-3, "resources")];
+        assert_eq!(special.len(), expected.len());
+        for (slot, what) in expected {
+            let entry = special.iter().find(|s| s["slot"] == slot).unwrap();
+            assert_eq!(entry, &json!({"slot": slot, "what": what, "status": "not-checked", "stored": null}));
+        }
+    }
+
+    #[test]
+    fn signature_stored_hashes_stay_inside_code_directory() {
+        let mut signature = fx::code_signature_blob();
+        let parsed = codesign::parse(&signature).unwrap();
+        let cd = &parsed.code_directories[0];
+        let hash_offset = cd.length + u32::from(cd.hash_size);
+        // Both stored hashes lie beyond the CodeDirectory, inside the complete superblob.
+        assert!(cd.offset + hash_offset as usize + usize::from(cd.hash_size) <= signature.len());
+        signature[cd.offset + 16..cd.offset + 20].copy_from_slice(&hash_offset.to_be_bytes());
+        signature[cd.offset + 24..cd.offset + 28].copy_from_slice(&1u32.to_be_bytes());
+        let e = engine_with("hashes-past-code-directory", &signature_file(&signature));
+        let r = call(&e, "apple_signature_show", json!({}));
+        let checks = &r["result"]["hash_checks"][0]["result"];
+        assert_eq!(checks["checked"], true);
+        assert_eq!(checks["pages_unchecked"], 1);
+        assert_eq!(checks["pages_matched"], 0);
+        assert!(checks["pages_mismatched"].as_array().unwrap().is_empty());
+        assert_eq!(checks["special_slots"], json!([{"slot": -1, "what": "info-plist", "status": "not-checked", "stored": null}]));
+    }
+
+    #[test]
+    fn signature_special_hashes_cannot_precede_code_directory() {
+        let mut signature = fx::code_signature_blob();
+        let parsed = codesign::parse(&signature).unwrap();
+        let cd = &parsed.code_directories[0];
+        // Absolute subtraction would stay inside the superblob but precede this CodeDirectory.
+        assert!(cd.offset >= usize::from(cd.hash_size));
+        signature[cd.offset + 16..cd.offset + 20].copy_from_slice(&0u32.to_be_bytes());
+        signature[cd.offset + 24..cd.offset + 28].copy_from_slice(&1u32.to_be_bytes());
+        signature[cd.offset + 28..cd.offset + 32].copy_from_slice(&0u32.to_be_bytes());
+        let e = engine_with("hash-before-code-directory", &signature_file(&signature));
+        let r = call(&e, "apple_signature_show", json!({}));
+        let checks = &r["result"]["hash_checks"][0]["result"];
+        assert_eq!(checks["checked"], true);
+        assert_eq!(checks["special_slots"], json!([{"slot": -1, "what": "info-plist", "status": "not-checked", "stored": null}]));
     }
 
     #[test]
@@ -1559,6 +1701,43 @@ mod tests {
         // The bundle tools also accept the bundle folder.
         let m = call(&e, "apple_macho_show", json!({"path": app}));
         assert_eq!(m["result"]["selected"]["arch"], "arm64");
+    }
+
+    /// Both bundle walks read only `truncated`: a folder that couldn't be listed was "a limit",
+    /// with neither its name nor the reason, and the dylib trace still said it was complete.
+    #[test]
+    fn a_bundle_folder_that_cant_be_listed_is_named_with_its_reason() {
+        use super::super::artifact_tools::walk_testing::{assert_names_unlisted, close, unlisted_message};
+        let e = Engine::new(crate::testing::session());
+        let dir = tempfile::tempdir().unwrap();
+        let ui = dir.path().join("Interface");
+        std::fs::create_dir_all(ui.join("Closed")).unwrap();
+        std::fs::write(ui.join("Window.nib"), fx::keyed_nib()).unwrap();
+        std::fs::write(ui.join("Closed/Second.nib"), fx::keyed_nib()).unwrap();
+        let app = fx::write_app_bundle(dir.path());
+        std::fs::create_dir_all(app.join("Contents/Closed")).unwrap();
+        std::fs::write(app.join("Contents/Closed/Tool"), fx::macho_min(fx::CPU_ARM64, 2, &[], &[])).unwrap();
+
+        let nibs = call(&e, "apple_nib_decode", json!({"path": ui}));
+        assert_eq!(
+            (nibs["result"]["documents_total"].clone(), nibs["coverage"]["status"].clone(), unlisted_message(&nibs)),
+            (json!(2), json!("complete"), None)
+        );
+        let dylibs = call(&e, "apple_dylibs_resolve", json!({"path": app}));
+        assert_eq!((dylibs["coverage"]["status"].clone(), unlisted_message(&dylibs)), (json!("complete"), None));
+        assert!(dylibs["result"]["images"].as_array().unwrap().iter().any(|i| i["path"] == "Contents/Closed/Tool"), "{}", dylibs["result"]);
+
+        let Some(closed_ui) = close(&ui.join("Closed")) else { return };
+        let Some(closed_app) = close(&app.join("Contents/Closed")) else { return };
+        let nibs = e.call("apple_nib_decode", json!({"path": ui}), crate::CallOptions::new(crate::Caller::Mcp));
+        let dylibs = e.call("apple_dylibs_resolve", json!({"path": app}), crate::CallOptions::new(crate::Caller::Mcp));
+        drop((closed_ui, closed_app));
+        let (nibs, dylibs) = (nibs.unwrap().to_json(), dylibs.unwrap().to_json());
+        assert_eq!(nibs["result"]["documents_total"], 1, "{nibs}");
+        assert_names_unlisted(&nibs, "Closed");
+        assert!(!dylibs["result"]["images"].as_array().unwrap().iter().any(|i| i["path"] == "Contents/Closed/Tool"));
+        assert_names_unlisted(&dylibs, "Contents/Closed");
+        assert!(dylibs["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "truncated"), "{dylibs}");
     }
 
     #[test]

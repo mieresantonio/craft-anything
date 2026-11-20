@@ -381,7 +381,7 @@ fn cert_json(der_bytes: &[u8]) -> Value {
         Some(c) => json!({
             "subject": c.subject, "issuer": c.issuer, "serial": c.serial, "not_before": c.not_before, "not_after": c.not_after,
             "signature_algorithm": c.signature_algorithm, "public_key_algorithm": c.public_key_algorithm, "version": c.version,
-            "sha256": sha256_hex(der_bytes), "bytes": der_bytes.len(),
+            "sha256": sha256_hex(der_bytes), "bytes": der_bytes.len(), "notes": c.notes,
         }),
         None => json!({"sha256": sha256_hex(der_bytes), "bytes": der_bytes.len(), "error": "not a readable X.509 certificate"}),
     }
@@ -397,9 +397,13 @@ fn android_package_show(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
     let mut warnings = pkg.warnings.clone();
     let mut lims = Vec::new();
     // Manifest
+    let mut manifest_coverage = Coverage { status: CoverageStatus::Partial, ..Coverage::default() };
     let (manifest, manifest_xml) = match member(&pkg, "AndroidManifest.xml") {
         Some(Ok(b)) => match axml::parse(&b) {
             Ok(doc) => {
+                if !doc.truncated {
+                    manifest_coverage.status = CoverageStatus::Complete;
+                }
                 warnings.extend(doc.warnings.iter().map(|w| format!("AndroidManifest.xml: {w}")));
                 let xml = p.include_manifest_xml.then(|| doc.to_xml(256 * 1024));
                 (Some(axml::manifest(&doc)), xml)
@@ -550,7 +554,7 @@ fn android_package_show(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
         .summary(summary)
         .confidence(Confidence::Observed)
         .limitations(lims)
-        .coverage(Coverage::complete(z.entries.len() as u64));
+        .coverage(manifest_coverage);
     Ok(ToolOutput::evidence(b.build()?))
 }
 
@@ -651,7 +655,11 @@ fn android_components_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutpu
     let by_kind: BTreeMap<&str, Value> = counts.iter().map(|(k, (n, r))| (*k, json!({"total": n, "reachable_from_outside": r}))).collect();
     let reachable = m.components.iter().filter(|c| c.exported).count();
     let open = m.components.iter().filter(|c| c.exported && !component_guard(c, &m).1).count();
-    let (items, cov) = page(&rows, p.offset, p.limit);
+    let (items, mut cov) = page(&rows, p.offset, p.limit);
+    if doc.truncated {
+        cov.status = CoverageStatus::Partial;
+        cov.total = None;
+    }
 
     let target = m.target_sdk.as_deref().and_then(|s| s.parse::<u32>().ok());
     let rule = match target {
@@ -853,12 +861,14 @@ struct InsnRow {
 /// Java source of one class from JADX, or a reason it is missing. Never an error.
 fn jadx_source(ctx: &Ctx<'_>, input: &Path, class_java: &str) -> (Value, Option<Limitation>) {
     let settings = &ctx.session.settings;
-    let Some(jadx) = craft_anything_engines::locate("jadx", &settings.engines.tools, &settings.engine_store_dir()) else {
+    let Some(jadx) = settings.engine_path("jadx") else {
+        let why = super::external_disasm_tools::set_path_problem(ctx, "jadx")
+            .unwrap_or_else(|| "JADX is not installed (Settings → Engines, the engine store, or PATH).".into());
         return (
             json!({"status": "unavailable"}),
             Some(Limitation::new(
                 "jadx_not_installed",
-                "Java source was requested but JADX is not installed (Settings → Engines, the engine store, or PATH). The bytecode listing above is complete without it.",
+                format!("Java source was requested, but it can't be read: {why} The bytecode listing above is complete without it."),
             )),
         );
     };
@@ -868,7 +878,11 @@ fn jadx_source(ctx: &Ctx<'_>, input: &Path, class_java: &str) -> (Value, Option<
             return (json!({"status": "failed", "error": e.message}), Some(Limitation::new("jadx_failed", "Could not create a temporary folder for JADX.")));
         }
     };
-    let run = craft_anything_engines::jadx::run_single_class(&jadx, input, class_java, &out, ctx.cancel.clone());
+    // The Java runtime engine the settings or the engine store hold (the Java Ghidra's setup
+    // brings, say), which JADX's launcher wouldn't find on its own.
+    let java =
+        settings.java_set_for_ghidra().or_else(|| craft_anything_engines::locate_configured("java", &settings.engines.tools, &settings.engine_store_dir()));
+    let run = craft_anything_engines::jadx::run_single_class(&jadx, java.as_deref(), input, class_java, &out, ctx.cancel.clone());
     let result = match run {
         Ok(o) if o.success => {
             let simple = class_java.rsplit('.').next().unwrap_or(class_java);
@@ -968,7 +982,10 @@ fn android_method_show(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, T
                 .map(|i| InsnRow { offset: format!("{:04x}", i.offset), text: d.format_insn(i), opcode: format!("{:#04x}", i.opcode), units: i.units })
                 .collect();
             if !complete {
-                lims.push(Limitation::new("listing_incomplete", "Decoding stopped at an instruction that runs past the end of the code."));
+                lims.push(Limitation::new(
+                    "listing_incomplete",
+                    "The bytecode is truncated or exceeds an instruction or payload limit; some instructions or payload details may be omitted.",
+                ));
             }
             (rows, code.tries.clone(), Some((code.registers, code.ins, code.outs)), complete)
         }
@@ -1203,7 +1220,7 @@ fn android_resources_read(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput
 fn engines_apktool_check(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let _p: ClientParams = parse_params(params)?;
     let settings = &ctx.session.settings;
-    let found = craft_anything_engines::locate("apktool", &settings.engines.tools, &settings.engine_store_dir());
+    let found = settings.engine_path("apktool");
     let mut lims = Vec::new();
     let (version, error) = match &found {
         // A pinned install is apktool's jar, run with Java.
@@ -1236,7 +1253,10 @@ fn engines_apktool_check(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput,
     let summary = match (&found, &version) {
         (Some(p), Some(v)) => format!("Apktool {v} is available at {}. The built-in decoder is used by default and needs nothing installed.", p.display()),
         (Some(p), None) => format!("Apktool was found at {} but did not report a version. The built-in decoder works without it.", p.display()),
-        (None, _) => "Apktool is not installed. That's fine: android_resources_read and android_package_show use Craft Anything's built-in decoders.".into(),
+        (None, _) => format!(
+            "{} That's fine: android_resources_read and android_package_show use Craft Anything's built-in decoders.",
+            super::external_disasm_tools::set_path_problem(ctx, "apktool").unwrap_or_else(|| "Apktool is not installed.".into())
+        ),
     };
     let b = builder(ctx, "engines_apktool_check", Subject { kind: "engine".into(), sha256: None, name: Some("apktool".into()) }, json!({}))
         .result(json!({
@@ -1258,6 +1278,20 @@ mod tests {
     use crate::Engine;
     use craft_anything_testkit::android as fx;
     use serde_json::json;
+
+    #[test]
+    fn certificate_json_keeps_non_minimal_length_notes_and_identity() {
+        let canonical = fx::certificate_der("Length Signer", "Fixture Org");
+        let value = craft_anything_formats::der::read(&canonical, 0).unwrap();
+        let mut changed = vec![value.tag, 0x83, 0, (value.len >> 8) as u8, value.len as u8];
+        changed.extend_from_slice(value.bytes(&canonical).unwrap());
+        let certificate = super::cert_json(&changed);
+        assert_eq!(certificate["subject"], "CN=Length Signer, O=Fixture Org");
+        assert_eq!(certificate["bytes"], changed.len());
+        assert!(certificate["error"].is_null());
+        assert!(certificate["notes"].as_array().unwrap().iter().any(|note| note.as_str().unwrap().contains("not strict DER")));
+        assert!(super::cert_json(&canonical)["notes"].as_array().unwrap().is_empty());
+    }
 
     fn apk() -> String {
         craft_anything_testkit::temp_file("notes.apk", &fx::notes_apk()).to_string_lossy().into_owned()
@@ -1521,6 +1555,34 @@ mod tests {
         if status == "unavailable" {
             assert!(m["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "jadx_not_installed"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jadx_runs_on_the_java_runtime_engine() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        // The Java Ghidra's setup brings, in the engine store.
+        let home = d.path().join("engines").join("jdk").join("jdk-21.0.5+11");
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        std::fs::write(home.join("bin").join("java"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(home.join("bin").join("java"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A stand-in for JADX's launcher: it writes the class only when given that Java.
+        let jadx = d.path().join("jadx");
+        let script = format!(
+            "#!/bin/sh\n[ \"$JAVA_HOME\" = '{}' ] || {{ echo 'JAVA_HOME is not set' >&2; exit 1; }}\nmkdir -p \"$6/com/example/notes\" && echo 'class Util {{}}' > \"$6/com/example/notes/Util.java\"\n",
+            home.display()
+        );
+        std::fs::write(&jadx, script).unwrap();
+        std::fs::set_permissions(&jadx, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut s = crate::testing::session();
+        s.settings.engines.store_dir = Some(d.path().join("engines"));
+        s.settings.engines.tools.jadx = Some(jadx);
+        let e = Engine::new(s);
+        let m = call(&e, "android_method_show", json!({"path": apk(), "class_name": "com.example.notes.Util", "method_name": "log", "java_source": true}));
+        let source = &m["result"]["java_source"];
+        assert_eq!(source["status"], "ok", "{source}");
+        assert_eq!(source["text"].as_str().map(str::trim), Some("class Util {}"));
     }
 
     #[test]

@@ -19,6 +19,8 @@ use std::time::Duration;
 
 /// Largest file one read returns (the rest is paged with offset/limit).
 const MAX_READ: usize = 256 * 1024;
+/// Largest project file a read holds in memory at once (16 MiB); larger files are refused.
+const MAX_READ_FILE: u64 = 16 * 1024 * 1024;
 /// Largest file a write may create.
 const MAX_WRITE: usize = 8 * 1024 * 1024;
 /// Most entries one listing returns.
@@ -42,7 +44,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "build_files_list",
             "List project files",
-            "List files and folders in the project being built (default: app/), a few levels deep. Paths are relative to the project folder; build output and dependencies (node_modules, target, dist…) are skipped.",
+            "List files and folders in the app: app/ usually, or the project folder when the app is edited in place. A few levels deep; paths are relative to the project folder; build output and dependencies (node_modules, target, vendor, dist…) are skipped.",
             "Shows the files being built.",
             Effects::READ_ONLY,
             schema_of::<ListParams>,
@@ -99,7 +101,8 @@ pub fn specs() -> Vec<ToolSpec> {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListParams {
-    /// A folder relative to the project (default `app`).
+    /// A folder relative to the project (default: the app folder; for a project edited in
+    /// place, the project folder itself).
     #[serde(default)]
     pub path: Option<String>,
     /// How many levels down (default 4, at most 8).
@@ -206,8 +209,38 @@ fn in_project(ws: &Workspace, rel: &str) -> Result<PathBuf, ToolError> {
     )
 }
 
+/// Resolve `rel` inside `ws`, falling back to `ws.app_dir()` when `rel` is missing at `ws.root`
+/// and doesn't already start with `app/`. Commands via `build_command_run` execute inside `app/`,
+/// so compiler diagnostics report paths relative to `app/` rather than the workspace root.
+fn in_project_or_app(ws: &Workspace, rel: &str, for_write: bool) -> Result<PathBuf, ToolError> {
+    let path = in_project(ws, rel)?;
+    if ws.manifest.app_in_root || path.exists() || rel.starts_with(['/', '\\']) {
+        return Ok(path);
+    }
+    let starts_with_app = inside(&ws.app_dir(), &path) || rel.split(['/', '\\']).find(|c| !c.is_empty() && *c != ".").is_none_or(|first| first == "app");
+    if starts_with_app {
+        return Ok(path);
+    }
+    let Some(app_path) = resolve(&ws.app_dir(), rel).filter(|p| really_inside(&ws.app_dir(), p) && really_inside(&ws.root, p)) else {
+        return Ok(path);
+    };
+    if app_path.exists() {
+        return Ok(app_path);
+    }
+    if for_write {
+        let app_parent_exists = app_path.parent().is_some_and(|parent| parent != ws.app_dir() && parent.is_dir());
+        let root_parent_exists = path.parent().is_some_and(|parent| parent != ws.root && parent.is_dir());
+        if app_parent_exists && !root_parent_exists {
+            return Ok(app_path);
+        }
+    }
+    Ok(path)
+}
+
 fn shown(ws: &Workspace, p: &Path) -> String {
-    p.strip_prefix(&ws.root).unwrap_or(p).to_string_lossy().replace('\\', "/")
+    let root = resolve(&ws.root, ".").unwrap_or_else(|| ws.root.clone());
+    let rel = p.strip_prefix(&root).unwrap_or(p);
+    if rel.as_os_str().is_empty() { ".".to_string() } else { rel.to_string_lossy().replace('\\', "/") }
 }
 
 fn refused(why: String) -> ToolError {
@@ -217,9 +250,13 @@ fn refused(why: String) -> ToolError {
 fn build_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: ListParams = parse_params(params)?;
     let ws = workspace(ctx)?;
-    let root = in_project(&ws, p.path.as_deref().unwrap_or("app"))?;
+    let default = if ws.manifest.app_in_root { "." } else { "app" };
+    let root = in_project_or_app(&ws, p.path.as_deref().unwrap_or(default), false)?;
+    // Our records are hidden from a listing of the project, but a listing of one of them (the
+    // builder is told to read capture/ and reference/) shows what is in it.
+    let listing_own = ws.is_own_record(&root);
     let depth = p.depth.unwrap_or(4).min(8);
-    const SKIP: [&str; 8] = ["node_modules", "target", "dist", "build", ".git", "Library", "Temp", "Intermediate"];
+    const SKIP: [&str; 9] = ["node_modules", "target", "vendor", "dist", "build", ".git", "Library", "Temp", "Intermediate"];
     let mut entries = Vec::new();
     let mut stack = vec![(root.clone(), 0usize)];
     let mut truncated = false;
@@ -232,6 +269,11 @@ fn build_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
                 break;
             }
             let path = e.path();
+            // Craft Anything's own records are not the app, even when the app is the project
+            // folder; the brief names them and the builder must leave them alone.
+            if !listing_own && ws.is_own_record(&path) {
+                continue;
+            }
             let name = e.file_name().to_string_lossy().into_owned();
             // A link is listed but never followed: it may lead out of the project.
             if e.file_type().is_ok_and(|t| t.is_symlink()) {
@@ -249,11 +291,34 @@ fn build_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     Ok(ToolOutput::Value(json!({"root": shown(&ws, &root), "entries": entries, "truncated": truncated})))
 }
 
+/// Read a project file a builder can hold in memory, with a plain error for one over the cap.
+fn read_file_for_builder(path: &Path, shown: &str) -> Result<Vec<u8>, ToolError> {
+    capped_for_builder(path, shown, "read", "Read a smaller file, or use a build command to print the part you need.")
+}
+
+/// Read a project file as text for an edit, refusing one over the same cap before it is loaded.
+fn read_text_for_edit(path: &Path, shown: &str) -> Result<String, ToolError> {
+    let bytes = capped_for_builder(path, shown, "edit", "Edit a smaller file, or use a build command to change it.")?;
+    String::from_utf8(bytes).map_err(|e| ToolError::io(path.display(), std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+}
+
+/// Read a whole project file with the builder's memory cap, so no path loads an oversized file.
+fn capped_for_builder(path: &Path, shown: &str, action: &str, remedy: &str) -> Result<Vec<u8>, ToolError> {
+    craft_anything_platform::fs::read_file_capped(path, MAX_READ_FILE).map_err(|e| {
+        if e.code == ErrorCode::OverLimit {
+            ToolError::new(ErrorCode::OverLimit, format!("{shown} is larger than the {} MB a builder can {action} at once.", MAX_READ_FILE / (1024 * 1024)))
+                .with_remediation(remedy)
+        } else {
+            e
+        }
+    })
+}
+
 fn build_file_read(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: ReadParams = parse_params(params)?;
     let ws = workspace(ctx)?;
-    let path = in_project(&ws, &p.path)?;
-    let bytes = std::fs::read(&path).map_err(|e| ToolError::io(path.display(), e))?;
+    let path = in_project_or_app(&ws, &p.path, false)?;
+    let bytes = read_file_for_builder(&path, &p.path)?;
     if bytes.iter().take(8000).any(|b| *b == 0) {
         return Err(ToolError::invalid(format!("{} is a binary file.", p.path)).with_remediation("Read text files; look at pictures with your own viewer."));
     }
@@ -274,7 +339,7 @@ fn build_file_read(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolE
         out.push('\n');
         n += 1;
     }
-    let mut v = json!({"path": p.path, "offset": start, "lines": n, "total_lines": lines.len(), "more": start + n < lines.len(), "text": out});
+    let mut v = json!({"path": shown(&ws, &path), "offset": start, "lines": n, "total_lines": lines.len(), "more": start + n < lines.len(), "text": out});
     if cut {
         v["note"] = json!(format!("Line {} is longer than {} KiB, so only its start is shown.", start + 1, MAX_READ / 1024));
     }
@@ -295,7 +360,7 @@ fn write_checked(ctx: &mut Ctx<'_>, path: &Path, content: &str) -> Result<(), To
 fn build_file_write(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: WriteParams = parse_params(params)?;
     let ws = workspace(ctx)?;
-    let path = in_project(&ws, &p.path)?;
+    let path = in_project_or_app(&ws, &p.path, true)?;
     write_checked(ctx, &path, &p.content)?;
     let mut out = json!({"written": shown(&ws, &path), "bytes": p.content.len()});
     // A model that leaves out `app/` would otherwise build beside the app, where no check looks.
@@ -308,8 +373,8 @@ fn build_file_write(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
 fn build_file_edit(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: EditParams = parse_params(params)?;
     let ws = workspace(ctx)?;
-    let path = in_project(&ws, &p.path)?;
-    let text = std::fs::read_to_string(&path).map_err(|e| ToolError::io(path.display(), e))?;
+    let path = in_project_or_app(&ws, &p.path, false)?;
+    let text = read_text_for_edit(&path, &p.path)?;
     let count = if p.old_text.is_empty() { 0 } else { text.matches(p.old_text.as_str()).count() };
     let new = match (count, p.replace_all) {
         (0, _) => return Err(ToolError::invalid(format!("old_text isn't in {}.", p.path)).with_remediation("Read the file again and copy the text exactly.")),
@@ -329,6 +394,8 @@ fn build_command_run(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
     approve(ctx, "Bash", &json!({"command": p.command}))?.map_err(refused)?;
     let app = ws.app_dir();
     std::fs::create_dir_all(&app).map_err(|e| ToolError::io(app.display(), e))?;
+    let inner = app.join("app");
+    let had_inner = inner.is_dir();
     let (shell, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
     let cancel = ctx.cancel.clone();
     ctx.report(None, format!("Running {}", p.command.chars().take(120).collect::<String>()));
@@ -349,20 +416,33 @@ fn build_command_run(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
         }
         s.get(start..).unwrap_or_default().to_string()
     };
-    Ok(ToolOutput::Value(json!({
+    let mut v = json!({
         "command": p.command,
+        "ran_in": ws.app_place(),
         "exit_code": out.code,
         "succeeded": out.success,
         "stdout": tail(out.stdout_text()),
         "stderr": tail(out.stderr_text()),
-    })))
+    });
+    // A model that reads file paths and commands from one base starts with `cd app`, or makes its
+    // project with `cargo new app`, from inside app/.
+    let first = p.command.split(['&', ';', '\n']).next().unwrap_or_default().trim().replace('\\', "/");
+    if ["cd app", "cd app/", "cd ./app", "cd ./app/"].contains(&first.as_str()) && !inner.is_dir() {
+        v["note"] = json!(format!("Commands already run in {}: leave out `cd app`.", ws.app_place()));
+    } else if !had_inner && app != ws.root && ["Cargo.toml", "package.json"].iter().any(|m| inner.join(m).is_file()) {
+        // Only a project: a folder named app is fine there (Next.js keeps its routes in one).
+        v["note"] = json!(
+            "This made a project in app/app/: commands already run in app/, so the app's project goes in app/ itself (app/Cargo.toml, app/package.json)."
+        );
+    }
+    Ok(ToolOutput::Value(v))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::inbox::InboxDir;
-    use crate::workspace::TargetRef;
+    use crate::workspace::{ExistingFiles, TargetRef};
     use crate::{CallOptions, Caller, Consent, Engine};
     use std::sync::Arc;
 
@@ -387,6 +467,7 @@ mod tests {
         call(&e, "build_file_edit", json!({"path": "app/src/main.rs", "old_text": "\"hi\"", "new_text": "\"hello\""})).unwrap();
         assert!(std::fs::read_to_string(ws.app_dir().join("src/main.rs")).unwrap().contains("hello"));
         let list = call(&e, "build_files_list", json!({})).unwrap();
+        assert_eq!(list["root"], "app");
         assert!(list["entries"].to_string().contains("app/src/main.rs"), "{list}");
         let page = call(&e, "build_file_read", json!({"path": "app/src/main.rs", "offset": 1, "limit": 1})).unwrap();
         assert_eq!(page["text"], "    println!(\"hello\");\n");
@@ -395,6 +476,138 @@ mod tests {
         assert!(call(&e, "build_file_edit", json!({"path": "app/src/main.rs", "old_text": "nope", "new_text": "x"})).is_err());
         assert!(call(&e, "build_file_read", json!({"path": "../../etc/passwd"})).is_err());
         assert!(call(&e, "build_file_write", json!({"path": "../outside.txt", "content": "x"})).is_err());
+    }
+
+    /// A project file over the read cap is refused instead of being read whole; a file exactly at
+    /// the cap still reads, with only its first page returned.
+    #[test]
+    fn a_file_over_the_read_cap_is_refused() {
+        let (_d, ws, e) = building();
+        std::fs::create_dir_all(ws.app_dir()).unwrap();
+        let cap = MAX_READ_FILE as usize;
+        std::fs::write(ws.app_dir().join("over-cap.txt"), "a".repeat(cap + 1)).unwrap();
+        let err = call(&e, "build_file_read", json!({"path": "app/over-cap.txt"})).unwrap_err();
+        assert_eq!(err.code, ErrorCode::OverLimit);
+        assert!(err.message.contains("16 MB"), "{err:?}");
+        std::fs::write(ws.app_dir().join("at-cap.txt"), "a".repeat(cap)).unwrap();
+        let ok = call(&e, "build_file_read", json!({"path": "app/at-cap.txt"})).unwrap();
+        assert_eq!((ok["lines"].as_u64(), ok["text"].as_str().map(str::len)), (Some(1), Some(MAX_READ + 1)));
+    }
+
+    /// An edit refuses a project file over the 16 MiB cap before reading it, and changes nothing.
+    #[test]
+    fn a_file_over_the_edit_cap_is_refused_and_left_unchanged() {
+        let (_d, ws, e) = building();
+        std::fs::create_dir_all(ws.app_dir()).unwrap();
+        let original = format!("old{}", "a".repeat(MAX_READ_FILE as usize));
+        let path = ws.app_dir().join("over-cap.txt");
+        std::fs::write(&path, &original).unwrap();
+        let err = call(&e, "build_file_edit", json!({"path": "app/over-cap.txt", "old_text": "old", "new_text": "new"})).unwrap_err();
+        assert_eq!(err.code, ErrorCode::OverLimit);
+        assert!(err.message.contains("16 MB"), "{err:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes(), "a refused edit must not change the file");
+    }
+
+    /// A file exactly at the edit cap still reads, and an edit that fits the write cap is saved.
+    #[test]
+    fn a_file_at_the_edit_cap_can_be_edited() {
+        let (_d, ws, e) = building();
+        std::fs::create_dir_all(ws.app_dir()).unwrap();
+        let cap = MAX_READ_FILE as usize;
+        let head = "start\n";
+        let mut original = String::with_capacity(cap);
+        original.push_str(head);
+        original.push_str(&"a".repeat(cap - head.len()));
+        let path = ws.app_dir().join("at-cap.txt");
+        std::fs::write(&path, &original).unwrap();
+        // Long enough that replacing it brings the file under the 8 MB a write may hold.
+        let old = "a".repeat(9 * 1024 * 1024);
+        let out = call(&e, "build_file_edit", json!({"path": "app/at-cap.txt", "old_text": old, "new_text": "b"})).unwrap();
+        assert_eq!(out["replaced"], 1);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.starts_with("start\nb"), "{:.20}", saved);
+        assert_eq!(saved.len(), cap - old.len() + 1);
+    }
+
+    /// "Work on my project" keeps the app in the project root: the default listing must be that
+    /// root, not a missing or nested `app/`, and not Craft Anything's own records.
+    #[test]
+    fn a_project_edited_in_place_is_listed_from_its_own_folder() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("main.py"), "print('hi')\n").unwrap();
+        std::fs::create_dir_all(d.path().join("src")).unwrap();
+        std::fs::write(d.path().join("src/app.py"), "x = 1\n").unwrap();
+        // A nested app/ would be the wrong default: the app itself is the root.
+        std::fs::create_dir_all(d.path().join("app")).unwrap();
+        std::fs::write(d.path().join("app/other.txt"), "not the app\n").unwrap();
+        let mut s = crate::testing::session();
+        let ws = Workspace::create_at(d.path(), "Mine", "Add a page", TargetRef::None, Some(ExistingFiles::Edit)).unwrap();
+        // checks/ isn't a Craft Anything record the builder must avoid: it keeps its own notes there.
+        std::fs::create_dir_all(d.path().join("checks")).unwrap();
+        std::fs::write(d.path().join("checks/notes.md"), "note\n").unwrap();
+        // capture/ is an own record in the root listing, but the brief tells the builder to read it.
+        std::fs::create_dir_all(d.path().join("capture/pages")).unwrap();
+        std::fs::write(d.path().join("capture/README.md"), "evidence\n").unwrap();
+        std::fs::write(d.path().join("capture/pages/index.html"), "<p>evidence</p>\n").unwrap();
+        // A dependency tree bigger than the entry cap must not crowd out the app's own files.
+        std::fs::create_dir_all(d.path().join("vendor")).unwrap();
+        for i in 0..MAX_ENTRIES + 10 {
+            std::fs::write(d.path().join("vendor").join(format!("f{i:04}.txt")), b"x").unwrap();
+        }
+        s.ext.insert(Arc::new(InboxDir(ws.inbox_dir())));
+        let e = Engine::new(s);
+
+        let list = call(&e, "build_files_list", json!({})).unwrap();
+        assert_eq!(list["root"], ".");
+        let entries = list["entries"].to_string();
+        assert!(entries.contains("main.py") && entries.contains("src/app.py"), "{list}");
+        assert!(entries.contains("app/other.txt"), "a real nested folder is still part of the root: {list}");
+        assert!(entries.contains("checks/notes.md"), "the builder's own check notes stay visible: {list}");
+        assert!(!entries.contains("craft.json"), "Craft Anything's own records are not app files: {list}");
+        assert!(!entries.contains("capture/"), "capture stays out of the default root listing: {list}");
+        assert!(entries.contains("vendor/"), "the dependency folder is listed but not walked: {list}");
+        assert_eq!(list["truncated"], false, "vendor must not consume the entry cap: {list}");
+
+        // The brief tells the builder to read capture/, so an explicit listing is allowed.
+        let capture = call(&e, "build_files_list", json!({"path": "capture"})).unwrap();
+        assert_eq!(capture["root"], "capture");
+        assert!(capture["entries"].to_string().contains("capture/README.md"), "{capture}");
+        assert!(capture["entries"].to_string().contains("capture/pages/"), "{capture}");
+        let pages = call(&e, "build_files_list", json!({"path": "capture/pages"})).unwrap();
+        assert_eq!(pages["root"], "capture/pages");
+        assert!(pages["entries"].to_string().contains("capture/pages/index.html"), "{pages}");
+        std::fs::create_dir_all(d.path().join("reference")).unwrap();
+        std::fs::write(d.path().join("reference/look.png"), "x").unwrap();
+        let reference = call(&e, "build_files_list", json!({"path": "reference"})).unwrap();
+        assert!(reference["entries"].to_string().contains("reference/look.png"), "{reference}");
+
+        // An explicit nested folder is still listed by that path.
+        let nested = call(&e, "build_files_list", json!({"path": "app"})).unwrap();
+        assert_eq!(nested["root"], "app");
+        assert!(nested["entries"].to_string().contains("app/other.txt"), "{nested}");
+    }
+
+    /// A project path with `..` must not make listing paths absolute or hide an explicit capture.
+    #[test]
+    fn an_explicit_capture_listing_handles_a_project_path_with_dot_dot() {
+        let base = tempfile::tempdir().unwrap();
+        let project = base.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let dotted = project.join("..").join("project");
+        let mut s = crate::testing::session();
+        let ws = Workspace::create_at(&dotted, "Mine", "Look at the evidence", TargetRef::None, None).unwrap();
+        std::fs::create_dir_all(ws.capture_dir()).unwrap();
+        std::fs::write(ws.capture_dir().join("README.md"), "evidence\n").unwrap();
+        assert!(ws.is_own_record(&ws.capture_dir().join("README.md")), "capture is an own record");
+        s.ext.insert(Arc::new(InboxDir(ws.inbox_dir())));
+        let e = Engine::new(s);
+
+        let capture = call(&e, "build_files_list", json!({"path": "capture"})).unwrap();
+        assert_eq!(capture["root"], "capture");
+        let entries = capture["entries"].to_string();
+        assert!(entries.contains("capture/README.md"), "{capture}");
+        let absolute = base.path().to_string_lossy().into_owned();
+        assert!(!entries.contains(&absolute), "paths stay relative: {capture}");
     }
 
     /// A link to a folder; false where this system won't let a test make one.
@@ -479,6 +692,30 @@ mod tests {
         assert!(err.message.contains("dev servers"), "{}", err.message);
     }
 
+    /// R5.4: a local model ran `cd app && cargo build` from inside app/, reading file paths and
+    /// commands from one base.
+    #[test]
+    fn a_command_says_where_it_ran() {
+        let (_d, _ws, e) = building();
+        let ok = call(&e, "build_command_run", json!({"command": "echo built"})).unwrap();
+        assert_eq!((ok["ran_in"].as_str(), ok["succeeded"].as_bool(), ok.get("note")), (Some("app/"), Some(true), None));
+        let lost = call(&e, "build_command_run", json!({"command": "cd app && echo built"})).unwrap();
+        assert_eq!(lost["succeeded"], false, "{lost}");
+        assert!(lost["note"].as_str().is_some_and(|n| n.contains("already run in app/")), "{lost}");
+        let lines = call(&e, "build_command_run", json!({"command": "cd app\necho built"})).unwrap();
+        assert!(lines["note"].as_str().is_some_and(|n| n.contains("already run in app/")), "{lines}");
+        // Live, its first command was `cargo new app`, which made a project in app/app/.
+        let nested = call(&e, "build_command_run", json!({"command": "mkdir app && cd app && echo [package]> Cargo.toml"})).unwrap();
+        assert!(nested["note"].as_str().is_some_and(|n| n.contains("This made a project in app/app/")), "{nested}");
+        // Once there, it's a folder of the app's own: going into it is left alone.
+        let inner = call(&e, "build_command_run", json!({"command": "cd app && echo built"})).unwrap();
+        assert_eq!((inner["succeeded"].as_bool(), inner.get("note")), (Some(true), None));
+        // A folder named app with no project in it is fine (Next.js keeps its routes in one).
+        let (_d, _ws, e) = building();
+        let routes = call(&e, "build_command_run", json!({"command": "mkdir app"})).unwrap();
+        assert_eq!(routes.get("note"), None, "{routes}");
+    }
+
     #[test]
     fn the_checklist_is_checked() {
         let (_d, _ws, e) = building();
@@ -493,5 +730,50 @@ mod tests {
         let e = Engine::new(crate::testing::session());
         let err = call(&e, "build_files_list", json!({})).unwrap_err();
         assert_eq!(err.code, ErrorCode::FeatureMissing);
+    }
+
+    #[test]
+    fn app_relative_paths_fall_back_to_app_dir() {
+        let (_d, ws, e) = building();
+        call(&e, "build_file_write", json!({"path": "app/crates/example/src/board.rs", "content": "pub struct Board;\n"})).unwrap();
+
+        // Compiler errors from build_command_run emit paths relative to app/ (without app/ prefix).
+        let r = call(&e, "build_file_read", json!({"path": "crates/example/src/board.rs"})).unwrap();
+        assert_eq!(r["path"], "app/crates/example/src/board.rs");
+        assert_eq!(r["text"], "pub struct Board;\n");
+
+        // build_file_edit falls back to the existing file in app/.
+        let ed = call(&e, "build_file_edit", json!({"path": "crates/example/src/board.rs", "old_text": "Board", "new_text": "CanvasBoard"})).unwrap();
+        assert_eq!(ed["edited"], "app/crates/example/src/board.rs");
+        assert!(std::fs::read_to_string(ws.app_dir().join("crates/example/src/board.rs")).unwrap().contains("CanvasBoard"));
+
+        // build_files_list falls back when listing an app-relative subdirectory.
+        let list = call(&e, "build_files_list", json!({"path": "crates/example"})).unwrap();
+        assert_eq!(list["root"], "app/crates/example");
+        assert!(list["entries"].to_string().contains("app/crates/example/src/board.rs"), "{list}");
+
+        // build_file_write writes inside app/ when the parent folder already exists in app/ and not at root.
+        let wr = call(&e, "build_file_write", json!({"path": "crates/example/src/new_mod.rs", "content": "pub struct NewMod;\n"})).unwrap();
+        assert_eq!((wr["written"].as_str(), wr.get("note")), (Some("app/crates/example/src/new_mod.rs"), None));
+        assert!(ws.app_dir().join("crates/example/src/new_mod.rs").is_file());
+        assert!(!ws.root.join("crates/example/src/new_mod.rs").exists());
+
+        // Overwriting an existing file via build_file_write without app/ also targets app/.
+        let ov = call(&e, "build_file_write", json!({"path": "crates/example/src/board.rs", "content": "pub struct Updated;\n"})).unwrap();
+        assert_eq!(ov["written"], "app/crates/example/src/board.rs");
+
+        // Root-level stray file without an app-specific parent still writes to root with the note.
+        let stray = call(&e, "build_file_write", json!({"path": "README.md", "content": "hi"})).unwrap();
+        assert!(stray["note"].as_str().unwrap().contains("outside app/"), "{stray}");
+
+        // Explicit app/ paths (including ./app/...) must never fall back into a nested app/app/.
+        call(&e, "build_file_write", json!({"path": "app/app/page.tsx", "content": "nested"})).unwrap();
+        let err_plain = call(&e, "build_file_read", json!({"path": "app/page.tsx"})).unwrap_err();
+        let err_dot = call(&e, "build_file_read", json!({"path": "./app/page.tsx"})).unwrap_err();
+        assert_eq!(err_plain.code, err_dot.code);
+        let written = call(&e, "build_file_write", json!({"path": "./app/page.tsx", "content": "top"})).unwrap();
+        assert_eq!(written["written"], "app/page.tsx");
+        assert_eq!(std::fs::read_to_string(ws.app_dir().join("app/page.tsx")).unwrap(), "nested");
+        assert_eq!(std::fs::read_to_string(ws.app_dir().join("page.tsx")).unwrap(), "top");
     }
 }

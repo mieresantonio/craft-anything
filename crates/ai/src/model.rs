@@ -26,6 +26,12 @@ pub enum Block {
         name: String,
         input: Value,
     },
+    /// What the server attached to the tool call `tool_use_id`, sent back with it unchanged
+    /// (Gemini's thought signature: a call without it is refused).
+    ToolExtra {
+        tool_use_id: String,
+        extra: Value,
+    },
     ToolResult {
         tool_use_id: String,
         content: String,
@@ -217,6 +223,8 @@ pub struct TurnResult {
     pub stop: StopReason,
     pub usage: Usage,
     pub model: String,
+    /// A provider-specific instruction to send to the model before continuing.
+    pub follow_up: Option<String>,
 }
 
 /// Streaming pieces while a turn is generated.
@@ -224,6 +232,8 @@ pub struct TurnResult {
 pub enum Delta {
     Text(String),
     Thinking(String),
+    /// A line for the feed about the request itself, not the model's words (a wait for its rate limit).
+    Status(String),
 }
 
 /// Cooperative cancellation for a conversation.
@@ -264,4 +274,9 @@ pub trait ChatModel: Send {
     fn turn(&mut self, req: &TurnRequest<'_>, on_delta: &mut dyn FnMut(Delta), stop: &Stop) -> Result<TurnResult, ToolError>;
     /// Model id, for display, journal and pricing.
     fn model(&self) -> String;
+    /// The context window its server says it has loaded, when it says one (see [`crate::window`]).
+    /// Asked on the agent's worker, never on the UI thread.
+    fn context_window(&self) -> Option<crate::window::Window> {
+        None
+    }
 }

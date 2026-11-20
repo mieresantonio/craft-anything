@@ -11,7 +11,7 @@
 //!
 //! Replay is read-only. A write answers what was recorded and changes nothing later reads see.
 
-use crate::web_har::{CREDENTIAL_HEADERS, Redactor, is_credential_param, is_uuid, split_url};
+use crate::web_har::{CREDENTIAL_HEADERS, Redactor, contains_ascii_ci, decode_query_name, is_credential_param, is_uuid, replace_needles_with, split_url};
 use craft_anything_formats::har::{self, Har, HarEntry, HarError};
 use craft_anything_formats::sourcemap::base64_decode;
 use serde::{Deserialize, Serialize};
@@ -331,21 +331,15 @@ impl Scrub {
     }
 
     fn holds_hidden(&self, s: &str) -> bool {
-        self.needles.iter().any(|n| s.contains(n.as_str()))
+        self.needles.iter().any(|n| contains_ascii_ci(s, n))
     }
 
     fn hide(&mut self, s: String) -> String {
         if !self.holds_hidden(&s) {
             return s;
         }
-        let mut out = s;
-        for n in &self.needles {
-            let found = out.matches(n.as_str()).count() as u64;
-            if found > 0 {
-                self.dropped.hidden_values = self.dropped.hidden_values.saturating_add(found);
-                out = out.replace(n.as_str(), DROPPED);
-            }
-        }
+        let (out, found) = replace_needles_with(&s, &self.needles, DROPPED);
+        self.dropped.hidden_values = self.dropped.hidden_values.saturating_add(found);
         out
     }
 
@@ -473,18 +467,19 @@ impl Scrub {
         let mut names = Vec::new();
         let mut kept = Vec::new();
         for (k, v) in pairs {
-            if self.holds_hidden(k) {
+            if self.holds_hidden(k) || self.holds_hidden(&decode_query_name(k)) {
                 if count {
                     self.dropped.hidden_values = self.dropped.hidden_values.saturating_add(1);
                 }
                 continue;
             }
             names.push(k.clone());
+            let hidden_val = self.holds_hidden(v) || self.holds_hidden(&decode_query_name(v));
             if v.is_empty() {
                 kept.push(k.clone());
-            } else if is_credential_param(k) || is_secret_json_key(k) || looks_secret(v) || self.holds_hidden(v) {
+            } else if is_credential_param(k) || is_secret_json_key(k) || looks_secret(v) || hidden_val {
                 if count {
-                    if self.holds_hidden(v) {
+                    if hidden_val {
                         self.dropped.hidden_values = self.dropped.hidden_values.saturating_add(1);
                     } else {
                         self.dropped.query_values = self.dropped.query_values.saturating_add(1);
@@ -843,7 +838,17 @@ pub fn build(har: &Har, opts: &BuildOptions) -> StandIn {
         for n in &s.query_names {
             push_unique_sorted(&mut route.query_names, n);
         }
-        if route.samples.len() >= opts.max_samples_per_route {
+        let full = route.samples.len() >= opts.max_samples_per_route;
+        let replace = if full {
+            let request_key = sample_request_key(s, &scrub);
+            route
+                .samples
+                .iter()
+                .position(|sample| sample.status == 304 && sample.path == s.path && sample.query == s.query && sample.request_key == request_key)
+        } else {
+            None
+        };
+        if full && replace.is_none() {
             route.samples_left_out = route.samples_left_out.saturating_add(1);
             // Still read its headers, so what's dropped is counted the same however many are kept.
             let _ = scrub.headers(&s.entry.response.headers);
@@ -852,16 +857,7 @@ pub fn build(har: &Har, opts: &BuildOptions) -> StandIn {
         }
         let mut sample = make_sample(s, opts, &mut scrub);
         // A request polled over and over gives the same answer many times; one is enough.
-        let repeats_last = |sample: &Sample| {
-            route.samples.last().is_some_and(|p| {
-                p.path == sample.path
-                    && p.query == sample.query
-                    && p.request_key == sample.request_key
-                    && p.status == sample.status
-                    && p.text == sample.text
-                    && p.base64 == sample.base64
-            })
-        };
+        let repeats_last = |sample: &Sample| route.samples.last().is_some_and(|last| same_sample(last, sample));
         let mut repeat = repeats_last(&sample);
         if !repeat {
             let size = sample.text.as_ref().map_or(0, String::len).saturating_add(sample.base64.as_ref().map_or(0, String::len));
@@ -881,7 +877,18 @@ pub fn build(har: &Har, opts: &BuildOptions) -> StandIn {
             }
         }
         note_status(route, sample.status, sample.content_type.as_deref(), &mut scrub);
+        if replace.is_some() && (sample.status == 304 || sample.body_left_out.is_some_and(|reason| reason != BodyLeftOut::NotRecorded)) {
+            // A missing cached body or a refused body cannot improve the stored evidence. Neither was charged.
+            route.samples_left_out = route.samples_left_out.saturating_add(1);
+            continue;
+        }
         if !repeat {
+            if let Some(at) = replace {
+                // The position came from this unchanged sample list. Remove only an unavailable
+                // answer to this exact request; append the replacement in recording order.
+                route.samples.remove(at);
+                route.samples_left_out = route.samples_left_out.saturating_add(1);
+            }
             route.samples.push(sample);
         }
     }
@@ -900,6 +907,34 @@ pub fn build(har: &Har, opts: &BuildOptions) -> StandIn {
         dropped: scrub.dropped,
         skipped,
     }
+}
+
+fn same_sample(left: &Sample, right: &Sample) -> bool {
+    // Keep this exhaustive so a new response field cannot silently disappear from repeat checks.
+    let Sample { path, query, request_key, status, content_type, headers, text, base64, body_left_out, was_not_modified } = left;
+    path == &right.path
+        && query == &right.query
+        && request_key == &right.request_key
+        && status == &right.status
+        && content_type == &right.content_type
+        && text == &right.text
+        && base64 == &right.base64
+        && body_left_out == &right.body_left_out
+        && was_not_modified == &right.was_not_modified
+        && same_headers(headers, &right.headers)
+}
+
+fn same_headers(left: &[(String, String)], right: &[(String, String)]) -> bool {
+    // Header names are case-insensitive; different names may move, but values for one name
+    // must keep their order. Capture caps this list, and the stored representation stays intact.
+    left == right
+        || (left.len() == right.len()
+            && left.iter().all(|(name, _)| {
+                left.iter()
+                    .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value)
+                    .eq(right.iter().filter(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, value)| value))
+            }))
 }
 
 fn push_unique_sorted(list: &mut Vec<String>, value: &str) {
@@ -929,12 +964,16 @@ fn note_status(route: &mut StandInRoute, status: u16, mime: Option<&str>, scrub:
     }
 }
 
+fn sample_request_key(s: &Seen<'_>, scrub: &Scrub) -> Option<String> {
+    s.entry.request.post.as_ref().and_then(|p| p.text.as_deref()).and_then(|t| request_key(t.as_bytes())).filter(|k| !scrub.holds_hidden(k))
+}
+
 fn make_sample(s: &Seen<'_>, opts: &BuildOptions, scrub: &mut Scrub) -> Sample {
     let r = &s.entry.response;
     let mut sample = Sample {
         path: s.path.clone(),
         query: s.query.clone(),
-        request_key: s.entry.request.post.as_ref().and_then(|p| p.text.as_deref()).and_then(|t| request_key(t.as_bytes())).filter(|k| !scrub.holds_hidden(k)),
+        request_key: sample_request_key(s, scrub),
         status: u16::try_from(r.status).unwrap_or(500),
         content_type: clean_mime(r.mime.as_deref(), scrub),
         headers: scrub.headers(&r.headers),
@@ -972,8 +1011,9 @@ fn make_sample(s: &Seen<'_>, opts: &BuildOptions, scrub: &mut Scrub) -> Sample {
             Err(e) => {
                 // Can't be edited in place, so a named secret or a key in it costs the whole body.
                 let bytes = e.as_bytes();
-                let contains = |needle: &[u8]| !needle.is_empty() && bytes.windows(needle.len()).any(|w| w == needle);
-                if scrub.needles.iter().any(|n| contains(n.as_bytes())) || contains(b"PRIVATE KEY-----") {
+                let contains_ci = |needle: &[u8]| !needle.is_empty() && bytes.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle));
+                let has_pem = bytes.windows(b"PRIVATE KEY-----".len()).any(|w| w == b"PRIVATE KEY-----");
+                if scrub.needles.iter().any(|n| contains_ci(n.as_bytes())) || has_pem {
                     scrub.dropped.body_values = scrub.dropped.body_values.saturating_add(1);
                     sample.body_left_out = Some(BodyLeftOut::HeldSecret);
                     return sample;

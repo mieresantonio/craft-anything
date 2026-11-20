@@ -1,5 +1,6 @@
 //! UI smoke tests: every screen draws, the main controls work, and nothing blocks or panics.
 
+use craft_anything_ai::{BackendConfig, BackendKind};
 use craft_anything_engine::{Mode, TargetKind};
 use craft_anything_ui_egui::state::{ChatItem, FirstRunStep, RailKind, Screen};
 use craft_anything_ui_egui::{CraftApp, demo};
@@ -31,12 +32,15 @@ fn wait(h: &mut Harness<'static, CraftApp>, done: impl Fn(&CraftApp) -> bool) ->
     false
 }
 
+/// First run goes from the welcome to the AI step, with the window controls there throughout.
 #[test]
 fn first_run_walks_through_four_screens() {
     let mut h = harness(|| demo::app(demo::engine(Mode::Beginner, false)));
     h.run_steps(3);
-    // The window controls are there from the first screen (the native frame is off).
-    h.get_by_label("Close");
+    // The window controls are there from the first screen (the native frame is off; macOS draws its own).
+    if !craft_anything_ui_egui::titlebar::NATIVE_FRAME {
+        h.get_by_label("Close");
+    }
     h.get_by_label("I'm new to this").click();
     h.run_steps(3);
     assert_eq!(h.state().state.first_run, FirstRunStep::Brain);
@@ -105,9 +109,14 @@ fn first_run_continue_is_reachable_at_the_smallest_window() {
 fn simple_title_bar_keeps_only_the_essentials() {
     let mut h = harness(|| demo::app(demo::engine(Mode::Beginner, true)));
     h.run_steps(3);
-    assert!(h.query_by_label("Advanced").is_none(), "the mode switch lives in Settings in Simple mode");
+    // The title bar has no mode switch in Simple mode: the only one is on Make, beside the ways in.
+    let door = h.get_by_label("Make my own version").rect().center().y;
+    for n in h.query_all_by_label("Advanced") {
+        assert!((n.rect().center().y - door).abs() < 4.0, "the mode switch lives in Settings and on Make in Simple mode");
+    }
     h.get_by_label("Settings");
-    h.get_by_label("Clean room");
+    // The title bar's Clean room switch stays (Make's tiles have one too, further down).
+    assert!(h.query_all_by_label("Clean room").any(|n| n.rect().bottom() < door), "the Clean room switch is in the title bar");
 }
 
 #[test]
@@ -200,6 +209,30 @@ fn turning_on_generated_assets_without_a_fal_key_asks_for_one() {
 }
 
 #[test]
+fn ghidra_is_looked_up_once_and_again_only_when_asked() {
+    let d = tempfile::tempdir().unwrap();
+    let store = d.path().join("engines");
+    let remembered = std::path::PathBuf::from("/remembered/support/analyzeHeadless");
+    let found = remembered.clone();
+    let mut h = harness_sized(egui::vec2(1280.0, 800.0), move || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        // An empty engine store, and nowhere else looked in: a lookup finds no Ghidra here.
+        a.settings.engines.store_dir = Some(store);
+        a.settings.engines.only_configured = true;
+        a.ghidra.found = Some(Some(found));
+        a
+    });
+    h.run_steps(3);
+    // What was found is kept while drawing, not looked up again (a lookup would find nothing).
+    assert_eq!(h.state_mut().ghidra_found(), Some(remembered.as_path()));
+    assert!(h.state_mut().ghidra_ready());
+    // After a settings change or an install it is looked up again.
+    h.state_mut().ghidra.found = None;
+    assert_eq!(h.state_mut().ghidra_found(), None);
+    assert!(!h.state_mut().ghidra_ready());
+}
+
+#[test]
 fn deep_mode_without_ghidra_asks_to_get_it_before_using_it() {
     use craft_anything_engine::workspace::TargetRef;
     use craft_anything_engines::game::{Builder, Installed, Inventory};
@@ -246,6 +279,27 @@ fn deep_mode_without_ghidra_asks_to_get_it_before_using_it() {
     assert_eq!(h.state().state.modal, Some(Modal::Ghidra));
     assert!(h.state().ghidra.start_after.is_some(), "the build starts once Ghidra is ready");
     h.get_by_label("Build without it");
+}
+
+/// A game's chosen folder is shown like every chosen folder: cut to fit its row, never widening the
+/// page, with the whole path on hover.
+#[test]
+fn a_long_game_folder_stays_inside_the_window() {
+    let folder = format!("D:/Games/{}/Cave Game", "A folder with a very long name ".repeat(12).trim());
+    let path = std::path::PathBuf::from(&folder);
+    let mut h = harness(move || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        demo::deep(&mut a);
+        a.state.screen = Screen::GameFiles;
+        a.state.game.folder = Some(path);
+        a
+    });
+    h.run_steps(4);
+    let width = h.ctx.content_rect().width();
+    let shown = craft_anything_ui_egui::short_path(std::path::Path::new(&folder));
+    let r = h.get_by_label(&shown).rect();
+    assert!(r.right() <= width, "the folder ({r:?}) stays inside the {width}px window");
+    assert!(r.height() < 30.0, "it's cut to one line, not wrapped ({r:?})");
 }
 
 #[test]
@@ -712,6 +766,77 @@ fn the_builders_questions_can_come_to_the_person_for_one_project() {
 }
 
 #[test]
+fn approvals_are_chosen_from_the_prompt_box_and_its_menu() {
+    use craft_anything_engine::workspace::{ActionKind, Approval, TargetRef, Workspace};
+    let d = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+    let root = ws.root.clone();
+    let mut h = harness(move || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.workspace = Some(ws);
+        a.state.screen = Screen::Project;
+        a
+    });
+    h.run_steps(2);
+    let saved = |kind| Workspace::open(&root).unwrap().manifest.approvals.get(&kind).copied();
+    let feed_before = h.state().state.feed.len();
+    // /approvals changes one kind and sends nothing to the builder.
+    h.state_mut().state.project_input = "/approvals push ask".into();
+    h.run_steps(1);
+    h.get_by_label("Send (Enter)").click();
+    assert!(wait(&mut h, |_| saved(ActionKind::Publish) == Some(Approval::Ask)), "saved in the project");
+    assert!(h.state().state.project_input.is_empty(), "the box is cleared");
+    assert_eq!(h.state().state.feed.len(), feed_before, "nothing joined the build's conversation");
+    assert!(!h.state().runs.is_busy(&root), "no build started");
+    // One it can't read stays in the box to be fixed.
+    h.state_mut().state.project_input = "/approvals push".into();
+    h.run_steps(1);
+    h.get_by_label("Send (Enter)").click();
+    h.run_steps(2);
+    assert_eq!(h.state().state.project_input, "/approvals push");
+    h.state_mut().state.project_input.clear();
+    // The messages those left sit over the row under the box, where a click lands.
+    h.state_mut().state.toasts.clear();
+    h.run_steps(2);
+    // The menu under the box: one row per kind, and a click saves it.
+    h.get_by_label("Approvals").click();
+    h.run_steps(2);
+    assert!(egui::Popup::is_id_open(&h.ctx, egui::Id::new("project-approvals")), "the menu opened");
+    h.get_by_label("Reading the web");
+    h.get_by_label("Pushing and publishing");
+    let refuse = h.get_all_by_label("Refuse").count();
+    assert_eq!(refuse, craft_anything_engine::workspace::ACTION_KINDS.len(), "a switch for every kind");
+    h.get_all_by_label("Refuse").next().unwrap().click();
+    assert!(wait(&mut h, |_| saved(ActionKind::Web) == Some(Approval::Refuse)), "the first row is the web");
+    assert_eq!(saved(ActionKind::Publish), Some(Approval::Ask), "the other kinds keep theirs");
+}
+
+#[test]
+fn an_approval_that_cant_be_saved_isnt_shown_as_chosen() {
+    use craft_anything_engine::workspace::{TargetRef, Workspace};
+    let d = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+    let file = ws.root.join("craft.json");
+    let mut h = harness(move || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.workspace = Some(ws);
+        a.state.screen = Screen::Project;
+        a
+    });
+    h.run_steps(2);
+    // A newer Craft Anything saved it meanwhile: this one only reads it, so the choice is refused.
+    let current = craft_anything_engine::workspace::MANIFEST_VERSION;
+    let newer = std::fs::read_to_string(&file).unwrap().replacen(&format!("\"version\": {current}"), &format!("\"version\": {}", current + 1), 1);
+    assert!(newer.contains(&format!("\"version\": {}", current + 1)));
+    std::fs::write(&file, newer).unwrap();
+    h.state_mut().state.project_input = "/approvals push allow".into();
+    h.run_steps(1);
+    h.get_by_label("Send (Enter)").click();
+    assert!(wait(&mut h, |a| a.state.toasts.iter().any(|(t, _)| t.starts_with("Couldn't change the approvals:"))), "says it wasn't saved");
+    assert!(h.state().workspace.as_ref().unwrap().manifest.approvals.is_empty(), "the menu shows what's kept, not what was asked");
+}
+
+#[test]
 fn a_question_about_the_build_is_answered_without_building() {
     use craft_anything_engine::workspace::{TargetRef, Workspace};
     let d = tempfile::tempdir().unwrap();
@@ -763,6 +888,33 @@ fn a_question_about_the_build_is_answered_without_building() {
     assert!(!h.state().runs.is_busy(&root));
 }
 
+/// #1695: a project built by an agent that isn't asked questions (Codex) says so before a question
+/// is sent, and the question stays in the box.
+#[test]
+fn a_question_the_builder_cannot_answer_is_refused_before_it_is_sent() {
+    use craft_anything_engine::workspace::{TargetRef, Workspace};
+    let d = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(d.path(), "Snake", "A snake game", TargetRef::None).unwrap();
+    ws.manifest.builder = Some("Codex".into());
+    let root = ws.root.clone();
+    let mut h = harness(move || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.backends =
+            vec![BackendConfig { name: "Codex".into(), kind: BackendKind::AgentCli, model: "codex".into(), base_url: None, ssh_host: None, enabled: true }];
+        a.workspace = Some(ws);
+        a.state.screen = Screen::Project;
+        a
+    });
+    h.run_steps(2);
+    h.state_mut().state.project_input = "/btw where are the latest files".into();
+    h.run_steps(1);
+    h.get_by_label("Send (Enter)").click();
+    h.run_steps(2);
+    assert!(h.state().state.toasts.iter().any(|(t, err)| *err && t.starts_with("Codex can't be kept to only reading")), "{:?}", h.state().state.toasts);
+    assert_eq!(h.state().state.project_input, "/btw where are the latest files", "it stays in the box");
+    assert!(h.state().asked.get(&root).is_none_or(Vec::is_empty), "nothing was asked");
+}
+
 #[test]
 fn a_long_answer_scrolls_with_the_conversation_and_comes_back_after_a_restart() {
     use craft_anything_engine::questions::{self, AskedQuestion};
@@ -806,8 +958,66 @@ fn website_choice_stays_picked_while_the_address_is_empty() {
     h.get_by_label("Nothing — start fresh").click();
     h.run_steps(3);
     assert!(!h.state().state.make.editing_url);
-    assert!(h.query_by_label("How closely may Craft Anything look at it?").is_none(), "nothing to look at");
+    // Nothing to look at: the choice stays in view, dimmed, and says when it applies.
+    h.get_by_label("How closely may Craft Anything look at it?");
+    h.get_by_label("This applies once you choose something to recreate above.");
+    let deep = h.state().settings.deep_mode;
+    h.get_by_label("Deep").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings.deep_mode, deep, "a dimmed tile changes nothing");
     assert!(h.query_by_label("Type the website's address:").is_none());
+}
+
+/// Make's Simple / Advanced switch changes the app's mode and keeps the screen and the draft (#1286).
+#[test]
+fn the_make_card_switches_simple_and_advanced_and_keeps_the_draft() {
+    let mut h = harness(|| {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.state.make.request = "a calculator".into();
+        a
+    });
+    h.run_steps(3);
+    // Simple mode's title bar has no mode switch: Make offers it beside the ways in.
+    h.get_by_label("Mode");
+    h.get_by_label("Advanced").click();
+    h.run_steps(3);
+    assert_eq!(h.state().settings.mode, Mode::Experienced);
+    assert_eq!(h.state().state.make.request, "a calculator", "the draft stays");
+    assert_eq!(h.state().state.screen, Screen::Home, "Make stays in view instead of the workbench");
+    h.get_by_label("What do you want to recreate?");
+    // Back from the card's own switch: the title bar now has one too, higher up.
+    h.query_all_by_label("Simple").max_by(|a, b| a.rect().top().total_cmp(&b.rect().top())).unwrap().click();
+    h.run_steps(3);
+    assert_eq!(h.state().settings.mode, Mode::Beginner);
+    assert_eq!(h.state().state.make.request, "a calculator");
+}
+
+/// At the app's smallest window the Simple / Advanced switch moves under the ways in, inside the
+/// window (#1286).
+#[test]
+fn the_make_mode_switch_stays_inside_the_narrowest_window() {
+    // The app's smallest window (main.rs): the switch moves under the ways in instead of off the edge.
+    let mut h = harness_sized(egui::vec2(760.0, 520.0), || demo::app(demo::engine(Mode::Beginner, true)));
+    h.run_steps(3);
+    let door = h.get_by_label("Just look inside").rect();
+    let advanced = h.get_by_label("Advanced").rect();
+    assert!(advanced.right() <= 760.0, "the switch ends at {} in a 760-point window", advanced.right());
+    assert!(advanced.top() >= door.bottom(), "on its own line below the ways in");
+
+    // Review of #1286: the room the switch needs is measured (so a longer translation moves it
+    // down sooner), not a fixed width. At every width it's beside the ways in or below them,
+    // never over them, and inside the window.
+    for width in [1600.0, 1280.0, 1100.0, 1000.0, 900.0] {
+        let mut h = harness_sized(egui::vec2(width, 820.0), || demo::app(demo::engine(Mode::Beginner, true)));
+        h.run_steps(3);
+        let door = h.get_by_label("Just look inside").rect();
+        let (simple, advanced) = (h.get_by_label("Simple").rect(), h.get_by_label("Advanced").rect());
+        let mode = h.get_by_label("Mode").rect();
+        for part in [simple, advanced, mode] {
+            assert!(!part.intersects(door), "at {width}: {part:?} overlaps the ways in at {door:?}");
+            assert!(part.left() >= 0.0 && part.right() <= width, "at {width}: {part:?} leaves the window");
+        }
+    }
 }
 
 #[test]
@@ -820,7 +1030,8 @@ fn mode_switch_and_deep_toggle() {
         a
     });
     h.run_steps(3);
-    // Simple mode: the switch is in Settings.
+    // Simple mode: the switch is in Settings (and on Make, so look from another screen).
+    h.state_mut().state.screen = Screen::Ask;
     h.state_mut().state.settings_open = true;
     h.run_steps(3);
     h.get_by_label("Advanced").click();
@@ -893,6 +1104,43 @@ fn asking_without_ai_runs_the_built_in_engines() {
     h.get_by_label("Add a brain").click();
     h.run_steps(2);
     assert!(h.state().state.settings_open);
+}
+
+/// An AI that is turned off, picked in the titlebar: the chat says which one and that it is off. The
+/// built-in engines don't answer as though none were set up — that is the test above, where the
+/// backend is None.
+#[test]
+fn asking_an_ai_that_is_turned_off_says_so_instead_of_looking_alone() {
+    let mut h = harness(|| {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        demo::deep(&mut a);
+        for (name, enabled) in [("On", true), ("Off", false)] {
+            let config = BackendConfig {
+                name: name.into(),
+                kind: BackendKind::OpenaiCompatible,
+                model: "m".into(),
+                base_url: Some("http://127.0.0.1:9/v1".into()),
+                ssh_host: None,
+                enabled,
+            };
+            a.hub.add_backend(config, None).unwrap();
+        }
+        a.state.backend = Some("Off".into());
+        a.state.screen = Screen::Ask;
+        a
+    });
+    h.run_steps(3);
+    h.state_mut().send("What does this program do?");
+    h.run_steps(6);
+    let (said, add) = {
+        let chat = &h.state().state.chat;
+        (
+            chat.iter().any(|i| matches!(i, ChatItem::Error { message, .. } if message.contains("Off") && message.contains("turned off"))),
+            chat.iter().any(|i| matches!(i, ChatItem::AddBrain)),
+        )
+    };
+    assert!(said, "the chat says which AI is turned off");
+    assert!(!add, "an AI is set up, so there is nothing to add");
 }
 
 #[test]
@@ -1025,6 +1273,23 @@ fn workbench_lists_fall_back_gracefully() {
 }
 
 #[test]
+fn the_agent_console_status_stays_clear_of_its_tabs_when_narrow() {
+    let mut h = harness_sized(egui::vec2(1000.0, 500.0), || {
+        let mut a = demo::app(demo::engine(Mode::Experienced, true));
+        demo::fill_workbench(&mut a);
+        a
+    });
+    h.run_steps(4);
+    let log = h.get_by_label("Log").rect();
+    let row = log.y_range();
+    let status: Vec<_> = h.query_all_by_label_contains("findings").map(|n| n.rect()).filter(|r| row.contains(r.center().y)).collect();
+    assert!(!status.is_empty(), "the status is on the tabs' row");
+    for s in status {
+        assert!(log.right() <= s.left(), "the Log tab ends at {} and the status starts at {}", log.right(), s.left());
+    }
+}
+
+#[test]
 fn the_agent_console_keeps_its_size() {
     // The console's history and prompt box came out 17 points taller than the panel, so the panel
     // grew by that every frame until its maximum, and then the top of its tabs was cut off.
@@ -1040,6 +1305,83 @@ fn the_agent_console_keeps_its_size() {
     let top = h.get_by_label("Agent").rect().top();
     h.run_steps(10);
     assert_eq!(h.get_by_label("Agent").rect().top(), top, "the agent console grew while nothing changed");
+}
+
+#[test]
+fn the_agent_console_prompt_box_starts_tall_and_grows_inside_the_window() {
+    // #942: it started one line tall, too short to read what was being typed.
+    let mut h = harness_sized(egui::vec2(1920.0, 1030.0), || {
+        let mut a = demo::app(demo::engine(Mode::Experienced, true));
+        demo::fill_workbench(&mut a);
+        a
+    });
+    h.run_steps(4);
+    assert!(wait(&mut h, |a| a.jobs.running().all(|j| !j.visible)), "the lists finished loading");
+    h.get_by_label("Agent").click();
+    h.run_steps(4);
+    let empty = h.get_by_label("Ask a question").rect().height();
+    assert!(empty >= 50.0, "room for three lines, got {empty}");
+    let hint = "Enter to send · Shift+Enter for a new line";
+
+    // Eight lines fit: the field isn't scrolled, so its rect is what's on screen.
+    h.state_mut().state.input = ["a line"; 8].join("\n");
+    h.run_steps(6);
+    let field = h.get_by_label("Ask a question").rect();
+    let (tabs, below) = (h.get_by_label("Agent").rect(), h.get_by_label(hint).rect());
+    assert!(field.height() > empty * 2.0, "it grows as lines are added: {} after {empty}", field.height());
+    assert!(field.top() >= tabs.bottom() && field.bottom() <= below.top(), "all eight lines show: tabs={tabs:?}, field={field:?}, hint={below:?}");
+
+    // Past what fits it scrolls, and the console settles with its tabs and send row in the window.
+    h.state_mut().state.input = ["a line"; 60].join("\n");
+    h.run_steps(6);
+    let (tabs, below) = (h.get_by_label("Agent").rect(), h.get_by_label(hint).rect());
+    h.run_steps(20);
+    assert_eq!(h.get_by_label("Agent").rect(), tabs, "the console settles");
+    assert!(tabs.top() >= 0.0 && below.bottom() <= 1030.0, "the tabs and the send row stay in the window: tabs={tabs:?}, hint={below:?}");
+}
+
+#[test]
+fn the_agent_console_leaves_room_for_the_code_in_a_small_window() {
+    let mut h = harness_sized(egui::vec2(1000.0, 500.0), || {
+        let mut a = demo::app(demo::engine(Mode::Experienced, true));
+        demo::fill_workbench(&mut a);
+        a
+    });
+    h.run_steps(4);
+    assert!(wait(&mut h, |a| a.jobs.running().all(|j| !j.visible)), "the lists finished loading");
+    h.get_by_label("Agent").click();
+    h.run_steps(4);
+    let top = h.get_by_label("Agent").rect().top();
+    assert!(top > 200.0, "the console's tabs start at {top} of 500");
+}
+
+#[test]
+fn the_agent_console_opens_at_its_default_size() {
+    // The first frame guessed the prompt box too short; the panel grew to fit and saved that size.
+    let mut h = harness_sized(egui::vec2(1920.0, 1030.0), || {
+        let mut a = demo::app(demo::engine(Mode::Experienced, true));
+        demo::fill_workbench(&mut a);
+        a
+    });
+    h.run_steps(4);
+    let top = h.get_by_label("Agent").rect().top();
+    assert!((750.0..765.0).contains(&top), "a 280-point console's tabs start just below 750, got {top}");
+
+    // Dragging its top edge resizes it, and it stays that size (#942).
+    let edge = egui::pos2(900.0, 750.0);
+    h.hover_at(edge);
+    h.step();
+    h.input_mut().events.push(egui::Event::PointerButton { pos: edge, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+    h.step();
+    let up = edge - egui::vec2(0.0, 100.0);
+    h.hover_at(up);
+    h.step();
+    h.input_mut().events.push(egui::Event::PointerButton { pos: up, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+    h.run_steps(10);
+    let dragged = h.get_by_label("Agent").rect().top();
+    assert!((650.0..665.0).contains(&dragged), "its edge dragged up to 650, the tabs just below it, got {dragged}");
+    h.run_steps(10);
+    assert_eq!(h.get_by_label("Agent").rect().top(), dragged, "it stays at that size");
 }
 
 #[test]
@@ -1117,6 +1459,9 @@ fn an_ais_model_is_changed_in_settings() {
     h.get_by_label("Change…").click();
     assert!(wait(&mut h, |a| a.model_picker.as_ref().is_some_and(|(_, m)| m.as_deref() == Some(&["nomic-embed-text".to_string(), "qwen3:8b".into()][..]))));
     h.run_steps(2);
+    // An API backend shows its saved model, never Claude Code's "default" label.
+    h.get_by_value("nomic-embed-text");
+    assert!(h.query_by_value("Default (its own settings)").is_none());
     h.state_mut().set_model("Box", "qwen3:8b");
     assert!(wait(&mut h, |a| a.backends.iter().any(|b| b.name == "Box" && b.model == "qwen3:8b")));
     h.run_steps(2);
@@ -1124,29 +1469,73 @@ fn an_ais_model_is_changed_in_settings() {
     assert!(h.state().model_picker.is_none(), "the picker closes once a model is chosen");
 }
 
-/// #470: a model the list doesn't offer can be typed in.
 #[test]
-fn a_model_the_list_doesnt_offer_can_be_typed_in() {
-    let url = model_server();
-    let mut h = harness(move || {
-        let mut a = demo::app(demo::engine(Mode::Experienced, true));
-        a.hub.add_server("Box", &url, Some("nomic-embed-text"), None).unwrap();
-        a.state.settings_open = true;
-        a.state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Ai;
-        a
+fn an_api_backends_request_rate_is_set_in_settings() {
+    let mut h = harness(|| {
+        let mut app = demo::app(demo::engine(Mode::Experienced, true));
+        app.hub
+            .add_backend(
+                BackendConfig {
+                    name: "Local model".into(),
+                    kind: BackendKind::OpenaiCompatible,
+                    model: "test".into(),
+                    base_url: None,
+                    ssh_host: None,
+                    enabled: true,
+                },
+                None,
+            )
+            .unwrap();
+        app.state.settings_open = true;
+        app.state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Ai;
+        app
     });
     h.state_mut().refresh_backends();
-    assert!(wait(&mut h, |a| a.backends.iter().any(|b| b.name == "Box")));
+    assert!(wait(&mut h, |app| app.backends.iter().any(|backend| backend.name == "Local model")));
+    h.get_by_label("Requests per minute").focus();
     h.run_steps(2);
-    h.get_by_label("Change…").click();
-    assert!(wait(&mut h, |a| a.model_picker.as_ref().is_some_and(|(_, m)| m.is_some())));
+    h.get_by_label("Requests per minute").type_text("120");
     h.run_steps(2);
-    h.get_by_label("Another model").click();
-    h.run_steps(1);
-    h.get_by_label("Another model").type_text("my-own-model");
-    h.run_steps(1);
-    h.key_press(egui::Key::Enter);
-    assert!(wait(&mut h, |a| a.backends.iter().any(|b| b.name == "Box" && b.model == "my-own-model")));
+    h.get_by_label("Apply").click();
+    assert!(wait(&mut h, |app| app.backend_options.get("Local model").and_then(|options| options.requests_per_minute) == Some(120)));
+}
+
+/// R5.4: an API backend's tool list is chosen in Settings → AI, beside what Auto works out to.
+#[test]
+fn an_api_backends_tool_list_is_chosen_in_settings() {
+    let mut h = harness(|| {
+        let mut app = demo::app(demo::engine(Mode::Experienced, true));
+        app.hub
+            .add_backend(
+                BackendConfig {
+                    name: "Local model".into(),
+                    kind: BackendKind::OpenaiCompatible,
+                    model: "test".into(),
+                    base_url: None,
+                    ssh_host: None,
+                    enabled: true,
+                },
+                None,
+            )
+            .unwrap();
+        app.state.settings_open = true;
+        app.state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Ai;
+        app
+    });
+    h.state_mut().refresh_backends();
+    assert!(wait(&mut h, |app| app.backends.iter().any(|backend| backend.name == "Local model")));
+    h.get_by_label_contains("below a 64k window");
+    h.get_by_label("Builder's tools").click();
+    h.run_steps(2);
+    h.get_by_label("full").click();
+    assert!(wait(&mut h, |app| app.backend_options.get("Local model").and_then(|options| options.tools) == Some(craft_anything_ai::ToolList::Full)));
+    // The row waits for each save (#1946 review), and takes the next choice once it's done.
+    assert!(wait(&mut h, |app| app.jobs.running().next().is_none()));
+    h.run_steps(2);
+    h.get_by_label("Builder's tools").click();
+    h.run_steps(2);
+    h.get_by_label("lean").click();
+    assert!(wait(&mut h, |app| app.backend_options.get("Local model").and_then(|options| options.tools) == Some(craft_anything_ai::ToolList::Lean)));
 }
 
 /// #54, #98: an AI server on another computer is added by its address in Settings → AI, with a
@@ -1164,9 +1553,69 @@ fn an_ai_server_is_added_by_its_address() {
     h.get_by_label("Add an AI by its address");
     h.state_mut().server_form = craft_anything_ui_egui::ServerForm { name: "Studio box".into(), address: url.clone(), ..Default::default() };
     h.run_steps(1);
+    // The AI settings page scrolls, and the key row added in #1486 puts the form's Add button
+    // below its visible part. A pointer click there lands outside the scroll area, so scroll the
+    // page first, as a person would.
+    h.event(egui::Event::PointerMoved(egui::pos2(640.0, 400.0)));
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, -300.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run_steps(20);
     h.get_by_label("Add").click();
     assert!(wait(&mut h, |a| a.backends.iter().any(|b| b.name == "Studio box" && b.model == "qwen3:8b")), "added with a model that can chat");
     assert!(h.state().server_form.name.is_empty(), "the form empties once it's added");
+}
+
+/// #1434, review of #1436: a server's chat models are chosen from its dropdown, and a model picked
+/// there goes once the address is changed, so Add can't ask another server for it. A model typed
+/// by hand stays.
+#[test]
+fn a_model_picked_from_a_servers_list_is_chosen_there_and_goes_with_its_address() {
+    const A: &str = "http://127.0.0.1:0/v1";
+    let mut h = harness(|| {
+        let mut a = demo::app(demo::engine(Mode::Experienced, true));
+        a.state.settings_open = true;
+        a.state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Ai;
+        a.server_form = craft_anything_ui_egui::ServerForm {
+            name: "Npu".into(),
+            address: A.into(),
+            choices: Some((A.into(), vec!["deepseek-r1:8b".into(), "qwen3:8b".into()])),
+            ..Default::default()
+        };
+        a
+    });
+    h.run_steps(2);
+    // The form sits below the fold of the AI page: scroll to it, as a person would.
+    h.event(egui::Event::PointerMoved(egui::pos2(640.0, 400.0)));
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, -300.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run_steps(20);
+    h.get_by_label("Choose a model").click();
+    h.run_steps(3);
+    h.get_by_label("qwen3:8b").click();
+    h.run_steps(3);
+    assert_eq!(h.state().server_form.model, "qwen3:8b", "the dropdown fills the model field");
+    // The address is edited: the picked model was that server's, so it goes.
+    h.get_by_label("Server address").focus();
+    h.run_steps(1);
+    h.get_by_label("Server address").type_text("x");
+    h.run_steps(3);
+    assert_eq!(h.state().server_form.address, format!("{A}x"));
+    assert_eq!(h.state().server_form.model, "", "a model picked for another address goes");
+    assert!(h.query_by_label("Choose a model").is_none(), "nor is that address's list offered");
+    // A model typed by hand isn't touched by an address change.
+    h.state_mut().server_form.model = "my-own-model".into();
+    h.run_steps(1);
+    h.get_by_label("Server address").type_text("y");
+    h.run_steps(3);
+    assert_eq!(h.state().server_form.model, "my-own-model", "a typed model stays");
 }
 
 /// #53: an agent app installed where it isn't looked for gets its program chosen in Settings → AI,
@@ -1194,6 +1643,29 @@ fn an_agent_apps_program_is_set_in_settings() {
     h.get_by_label("Program: /opt/oc/opencode");
     h.get_by_label("Find it automatically").click();
     assert!(wait(&mut h, |a| program(a).is_none()));
+}
+
+/// #721: an agent whose saved program is gone says so in Settings → AI, with the program that runs
+/// in its place. A program found by its usual name has no file to save, so nothing is offered.
+#[test]
+fn a_saved_program_that_is_gone_is_said_in_settings() {
+    use craft_anything_ai::{BackendEntry, BackendOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let gone = dir.path().join("old-build").join("agent").display().to_string();
+    let mut h = harness(move || {
+        let a = demo::app(demo::engine(Mode::Experienced, true));
+        // cargo stands in for the agent's usual program: it's there wherever these tests run.
+        let config = BackendConfig { name: "Moved".into(), kind: BackendKind::AgentCli, model: "cargo".into(), base_url: None, ssh_host: None, enabled: true };
+        a.hub.add_backend_with(BackendEntry { config, options: BackendOptions { command: Some(gone), ..Default::default() } }, None).unwrap();
+        a
+    });
+    h.state_mut().refresh_backends();
+    assert!(wait(&mut h, |a| a.program_replaced.get("Moved").is_some_and(|p| p == "cargo")));
+    h.state_mut().state.settings_open = true;
+    h.state_mut().state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Ai;
+    h.run_steps(3);
+    h.get_by_label("It isn't there any more, so cargo runs in its place.");
+    assert!(h.query_by_label("Use it").is_none(), "a name on PATH isn't a file to save");
 }
 
 /// Claude Code's effort is chosen in Settings → AI, from every level Claude offers.
@@ -1227,6 +1699,97 @@ fn a_claude_ais_effort_is_set_in_settings() {
     assert!(wait(&mut h, |a| a.backend_options.get("Claude Code").and_then(|o| o.effort) == Some(Effort::Max)));
     h.run_steps(2);
     h.get_by_value("max");
+}
+
+/// #1813: an OpenAI-compatible AI has an effort setting too, showing "default" (nothing sent)
+/// until a level is chosen, and back again.
+#[test]
+fn an_openai_compatible_ais_effort_is_set_in_settings() {
+    use craft_anything_ai::{BackendConfig, BackendKind, Effort};
+    let mut h = harness(|| {
+        let a = demo::app(demo::engine(Mode::Experienced, true));
+        let cfg = BackendConfig {
+            name: "Box".into(),
+            kind: BackendKind::OpenaiCompatible,
+            model: "m".into(),
+            base_url: Some("http://127.0.0.1:0/v1".into()),
+            ssh_host: None,
+            enabled: true,
+        };
+        a.hub.add_backend(cfg, None).unwrap();
+        a
+    });
+    h.state_mut().refresh_backends();
+    assert!(wait(&mut h, |a| a.backends.iter().any(|b| b.name == "Box")));
+    h.state_mut().state.settings_open = true;
+    h.state_mut().state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Ai;
+    h.run_steps(2);
+    h.get_by_label("Effort:");
+    h.get_by_value("default").click();
+    h.run();
+    assert!(h.query_by_label("max").is_none(), "only OpenAI's levels");
+    h.get_by_label("xhigh").click();
+    assert!(wait(&mut h, |a| a.backend_options.get("Box").and_then(|o| o.effort) == Some(Effort::Xhigh)));
+    h.run_steps(2);
+    h.get_by_value("xhigh").click();
+    h.run();
+    h.get_by_label("default").click();
+    assert!(wait(&mut h, |a| a.backend_options.get("Box").and_then(|o| o.effort).is_none()));
+}
+
+/// Claude Code's model can be left at "Default (its own settings)", so a model customised in the
+/// person's own Claude Code config isn't overridden by a built-in default.
+#[test]
+fn claude_codes_model_can_be_left_to_its_own_settings() {
+    use craft_anything_ai::BackendConfig;
+    let mut h = harness(|| {
+        let a = demo::app(demo::engine(Mode::Experienced, true));
+        a.hub
+            .add_backend(
+                BackendConfig {
+                    name: "Claude Code".into(),
+                    kind: craft_anything_ai::BackendKind::AgentCli,
+                    model: "claude-code".into(),
+                    base_url: None,
+                    ssh_host: None,
+                    enabled: true,
+                },
+                None,
+            )
+            .unwrap();
+        a
+    });
+    h.state_mut().refresh_backends();
+    assert!(wait(&mut h, |a| a.backends.iter().any(|b| b.name == "Claude Code")));
+    h.state_mut().state.settings_open = true;
+    h.state_mut().state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Ai;
+    h.run_steps(2);
+    // With no choice saved, the picker says the default, and no model is passed on a run.
+    h.get_by_label("Model: Claude Code default");
+    h.get_by_label("Change…").click();
+    assert!(wait(&mut h, |a| {
+        a.model_picker
+            .as_ref()
+            .is_some_and(|(_, m)| m.as_deref().is_some_and(|models| models.first().is_some_and(|m| m == craft_anything_ai::anthropic::CLAUDE_CODE_DEFAULT)))
+    }));
+    h.run_steps(2);
+    // The dropdown shows the saved choice and lists "Default (its own settings)" first.
+    h.get_by_value("Default (its own settings)").click();
+    h.run_steps(2);
+    h.get_by_label("claude-sonnet-5-5").click();
+    assert!(wait(&mut h, |a| a.backend_options.get("Claude Code").and_then(|o| o.cli_model.as_deref()) == Some("claude-sonnet-5-5")));
+    h.run_steps(2);
+    // "Default (its own settings)" as the first choice: choosing it clears the saved model, so the
+    // run passes no `--model` and the person's own Claude Code config decides.
+    h.get_by_label("Change…").click();
+    assert!(wait(&mut h, |a| a.model_picker.as_ref().is_some_and(|(_, m)| m.is_some())));
+    h.run_steps(2);
+    h.get_by_value("claude-sonnet-5-5").click();
+    h.run_steps(2);
+    h.get_by_label("Default (its own settings)").click();
+    assert!(wait(&mut h, |a| a.backend_options.get("Claude Code").is_some_and(|o| o.cli_model.is_none())));
+    h.run_steps(2);
+    h.get_by_label("Model: Claude Code default");
 }
 
 /// The picker exposes only the chosen model's depths and clears an old depth when changing models.
@@ -1317,16 +1880,110 @@ fn claude_codes_account_folder_is_set_in_settings() {
     assert!(h.state().folder_inputs.is_empty(), "nothing left being typed");
     // A relative folder is refused; the saved one stays.
     h.state_mut().set_agent_folder("Claude Code", Some("claude-work".into()));
-    h.run_steps(4);
+    // Refusing a folder is background work too: an unchanged value alone does not mean the
+    // refusal has finished. Do not overlap it with the next settings mutation.
+    assert!(wait(&mut h, |a| a.jobs.running().next().is_none()));
     assert_eq!(chosen(h.state()).as_deref(), Some("~/.claude-work"));
     // Emptied, it's the usual folder again.
     h.state_mut().set_agent_folder("Claude Code", Some(String::new()));
-    assert!(wait(&mut h, |a| chosen(a).is_none()));
+    assert!(wait(&mut h, |a| chosen(a).is_none() && a.jobs.running().next().is_none()));
     // Added already, so it's offered again under the next free name, on the coding agents' tab.
     h.state_mut().state.detect_tab = Some(craft_anything_ui_egui::detect_tabs::DetectTab::Harnesses);
     h.run_steps(2);
+    h.get_by_label("Add another").scroll_to_me();
+    h.run();
     h.get_by_label("Add another").click();
-    assert!(wait(&mut h, |a| a.backends.iter().any(|b| b.name == "Claude Code 2" && b.model == "claude-code")));
+    assert!(
+        wait(&mut h, |a| a.backends.iter().any(|b| b.name == "Claude Code 2" && b.model == "claude-code")),
+        "backends: {:?}; jobs: {:?}; toasts: {:?}",
+        h.state().backends,
+        h.state().jobs.list.iter().map(|j| (&j.title, &j.outcome)).collect::<Vec<_>>(),
+        h.state().state.toasts
+    );
+}
+
+/// Zoom keys stop at 50% and 200%, Cmd/Ctrl 0 goes back to 100%, and a zoom saved outside the
+/// range comes back inside it.
+#[test]
+fn zoom_stays_between_half_and_double() {
+    fn press(h: &mut Harness<'static, CraftApp>, key: egui::Key, times: usize) {
+        for _ in 0..times {
+            h.key_press_modifiers(egui::Modifiers::COMMAND, key);
+            h.run_steps(2);
+        }
+    }
+    let mut h = harness(|| demo::app(demo::engine(Mode::Experienced, true)));
+    h.run_steps(2);
+    press(&mut h, egui::Key::Minus, 12);
+    assert_eq!(h.ctx.zoom_factor(), 0.5);
+    press(&mut h, egui::Key::Equals, 20);
+    assert_eq!(h.ctx.zoom_factor(), 2.0);
+    press(&mut h, egui::Key::Num0, 1);
+    assert_eq!(h.ctx.zoom_factor(), 1.0);
+    h.ctx.set_zoom_factor(0.2);
+    h.run_steps(3);
+    assert_eq!(h.ctx.zoom_factor(), 0.5);
+    assert_eq!(craft_anything_ui_egui::bounded_zoom(f32::NAN), 1.0);
+}
+
+/// macOS keeps its own window buttons beside the title bar, and they don't zoom, so the bar
+/// doesn't either: at 50%, 100% and 150% its controls keep their size and place on screen (zoomed
+/// points times the zoom), while the body below does zoom.
+#[cfg(target_os = "macos")]
+#[test]
+fn title_bar_keeps_its_size_when_zoomed() {
+    let on_screen = |zoom: f32| {
+        let mut h = harness_sized(egui::vec2(1360.0, 600.0), || demo::app(demo::engine(Mode::Experienced, true)));
+        h.ctx.set_zoom_factor(zoom);
+        h.run_steps(4);
+        // The topmost node with the label: Settings and Advanced appear in the bar first.
+        let rect = |label: &str| {
+            let r = h.get_all_by_label(label).map(|n| n.rect()).min_by(|a, b| a.top().total_cmp(&b.top())).unwrap();
+            egui::Rect::from_min_max(r.min * zoom, r.max * zoom)
+        };
+        (rect("Settings"), rect("Advanced"), rect("Filter"))
+    };
+    let (settings, advanced, filter) = on_screen(1.0);
+    // The bar is the system title bar's height, and its controls sit centred in it.
+    assert!((settings.center().y - 16.0).abs() <= 1.0, "settings button at {settings:?}");
+    for zoom in [0.5, 1.5] {
+        let (s, a, f) = on_screen(zoom);
+        for (name, at_100, now) in [("Settings", settings, s), ("Advanced", advanced, a)] {
+            let moved = (now.min - at_100.min).length().max((now.max - at_100.max).length());
+            assert!(moved <= 1.0, "{name} moved {moved} pt at {zoom}x: {at_100:?} → {now:?}");
+        }
+        let grew = f.height() / filter.height();
+        assert!((grew - zoom).abs() < 0.15, "the body should zoom: Filter grew {grew}x at {zoom}x");
+    }
+}
+
+/// Review of #1234: with System chosen, what's drawn follows the system's appearance frame by
+/// frame (`CraftApp::tick` reads it from each frame's input), back and forth; a chosen theme
+/// stays as it is whatever the system says.
+#[test]
+fn the_system_theme_follows_the_systems_appearance_as_it_changes() {
+    use craft_anything_ui_egui::theme::ThemeKind;
+    use egui::Theme::{Dark, Light};
+    let mut h = harness(|| demo::app(demo::engine(Mode::Beginner, true)));
+    h.run_steps(2);
+    assert_eq!(h.state().settings.theme, "system", "System is the default");
+    let drawn_dark = |h: &Harness<'static, CraftApp>| h.ctx.global_style().visuals.dark_mode;
+    for (system, kind) in [(Light, ThemeKind::StudioLight), (Dark, ThemeKind::Studio), (Light, ThemeKind::StudioLight)] {
+        h.input_mut().system_theme = Some(system);
+        h.run_steps(2);
+        assert_eq!(h.state().theme_kind(), kind, "System with the system {system:?}");
+        assert_eq!(drawn_dark(&h), kind == ThemeKind::Studio, "drawn to match the system {system:?}");
+    }
+    // A chosen theme overrides the system's appearance as it changes.
+    for (chosen, kind) in [("studio", ThemeKind::Studio), ("studio-light", ThemeKind::StudioLight)] {
+        h.state_mut().settings.theme = chosen.into();
+        for system in [Light, Dark, Light] {
+            h.input_mut().system_theme = Some(system);
+            h.run_steps(2);
+            assert_eq!(h.state().theme_kind(), kind, "{chosen} with the system {system:?}");
+            assert_eq!(drawn_dark(&h), kind == ThemeKind::Studio, "{chosen} drawn with the system {system:?}");
+        }
+    }
 }
 
 #[test]
@@ -1346,9 +2003,17 @@ fn settings_window_tabs_draw() {
         h.run_steps(2);
         assert_eq!(edge(&h), right, "the Settings window changed width on {tab}");
     }
+    // System is the default; picking a theme keeps it, and System can be picked again.
+    assert_eq!(h.state().settings.theme, "system");
     h.get_by_label("Studio Light").click();
     h.run_steps(3);
     assert_eq!(h.state().settings.theme, "studio-light");
+    assert_eq!(h.state().theme_kind(), craft_anything_ui_egui::theme::ThemeKind::StudioLight);
+    // Language says "System" too when none is chosen: take the one on Studio's line.
+    let line = h.get_by_label("Studio").rect().center().y;
+    h.query_all_by_label("System").find(|n| (n.rect().center().y - line).abs() < 4.0).expect("System beside Studio").click();
+    h.run_steps(3);
+    assert_eq!(h.state().settings.theme, "system");
 
     // At the same window size, the same tab keeps its content bounds with and without scrolling.
     let content_bounds = |overflow: bool| {
@@ -1472,7 +2137,7 @@ fn a_note_waiting_for_the_builder_can_be_taken_back_into_the_prompt_box() {
     h.state_mut().open_workspace(a.clone());
     h.state_mut().follow_up(Some("Add tags".into()));
     h.run_steps(2);
-    // Notes sent while it works wait under the conversation, not in it.
+    // Waiting notes only join the saved conversation once the builder reads them.
     for note in ["Make them blue", "And sortable"] {
         h.state_mut().state.project_input = note.into();
         h.state_mut().send_message();
@@ -1794,6 +2459,30 @@ fn a_projects_saved_time_and_ai_use_show_beside_it_and_the_session_total_in_the_
 }
 
 #[test]
+fn a_big_cost_doesnt_paint_over_its_caption() {
+    use craft_anything_engine::workspace::ProjectUsage;
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().to_path_buf();
+    ProjectUsage::update(&root, |u| {
+        u.work_ms = 725_000;
+        u.add_turn(1_180_000, 42_000, Some(13_021.36), true);
+    })
+    .unwrap();
+    let mut h = harness(move || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        demo::fill_project(&mut a);
+        if let Some(ws) = a.workspace.as_mut() {
+            ws.root = root.clone();
+        }
+        a
+    });
+    h.run_steps(3);
+    let caption = h.get_by_label("AI cost (estimate)").rect();
+    let value = h.get_by_label("about $13021.36").rect();
+    assert!(!caption.intersects(value), "{caption:?} and {value:?}");
+}
+
+#[test]
 fn ghidras_memory_is_automatic_until_the_person_sets_it() {
     let mut h = harness_sized(egui::vec2(1280.0, 1000.0), || {
         let mut a = demo::app(demo::engine(Mode::Beginner, true));
@@ -1847,6 +2536,27 @@ fn the_front_door_makes_something_or_just_looks_inside() {
     h.get_by_label("Make my own version").click();
     h.run_steps(3);
     h.get_by_label("What do you want to recreate?");
+}
+
+#[test]
+fn new_project_does_not_shift_when_its_scrollbar_is_not_needed() {
+    let mut h = harness_sized(egui::vec2(1000.0, 700.0), || demo::app(demo::engine(Mode::Beginner, true)));
+    h.run_steps(3);
+    let make_left = h.get_by_label("What do you want to make?").rect().left();
+    assert!(
+        h.query_all_by_role(egui::accesskit::Role::ScrollBar).any(|node| node.rect().left() > 200.0),
+        "the overflowing Make page should show its scrollbar"
+    );
+
+    h.get_by_label("Just look inside").click();
+    h.run_steps(20);
+    let look_left = h.get_by_label("What do you want to look inside?").rect().left();
+
+    assert_eq!(look_left, make_left, "removing the scrollbar must not recenter New project");
+    assert!(
+        h.query_all_by_role(egui::accesskit::Role::ScrollBar).all(|node| node.rect().left() <= 200.0),
+        "the short Just look inside page should not show a scrollbar"
+    );
 }
 
 #[test]
@@ -1905,6 +2615,43 @@ fn a_running_build_says_what_it_is_on_and_opens_up_into_its_activity() {
     assert!(runs.finish(&ws.root));
     h.run_steps(3);
     h.get_by_label("What happened in this build");
+}
+
+#[test]
+fn a_long_waiting_note_leaves_the_live_activity_and_prompt_visible() {
+    use craft_anything_ai::{
+        AgentEvent,
+        rebuild::{RunEvent, StandIns},
+    };
+    use craft_anything_engine::workspace::{Step, TargetRef, Workspace};
+    let d = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(d.path(), "Alpha", "A notes app", TargetRef::None).unwrap();
+    let runs = StandIns::new();
+    let (dir, r) = (d.path().to_path_buf(), runs.clone());
+    let size = egui::vec2(1280.0, 600.0);
+    let mut h = harness_sized(size, move || stand_in_app(dir, &r));
+    h.state_mut().open_workspace(ws.clone());
+    h.state_mut().follow_up(Some("Add tags".into()));
+    assert!(runs.send(&ws.root, RunEvent::Step { step: Step::Build, text: "Building the first version…".into() }));
+    assert!(runs.send(
+        &ws.root,
+        RunEvent::Agent(AgentEvent::ToolStarted { call_id: "test".into(), tool: "Bash".into(), input: serde_json::json!({"command": "cargo test --quiet"}) })
+    ));
+    h.run_steps(4);
+
+    let note = "Please make the notes sortable and keep the selected tags.\n".repeat(160);
+    h.state_mut().state.project_input = note.trim_end().into();
+    h.state_mut().send_message();
+    h.run_steps(4);
+
+    let prompt = h.get_by_label("Ask for a change").rect();
+    assert!(prompt.bottom() <= size.y, "the prompt box is on the screen");
+    let activity = h.query_all_by_label_contains("Now: Running cargo test --quiet").next().expect("the live activity is shown").rect();
+    assert!(activity.top() >= 0.0 && activity.bottom() < prompt.top(), "the live activity is visible above the prompt");
+    let details = h.get_by_label("More detail").rect();
+    assert!(details.top() >= 0.0 && details.bottom() < prompt.top(), "the activity log can be opened");
+    let send = h.get_by_label("Send now").rect();
+    assert!(send.top() >= 0.0 && send.bottom() < activity.top(), "the waiting note's controls are reachable");
 }
 
 #[test]
@@ -2304,6 +3051,59 @@ fn make_says_who_builds_and_a_picked_builder_stays_with_the_project() {
 }
 
 #[test]
+fn a_turned_off_make_choice_says_who_builds_instead() {
+    let mut h = harness(|| {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.backends.push(BackendConfig {
+            name: "Off".into(),
+            kind: BackendKind::Anthropic,
+            model: "test-model".into(),
+            base_url: None,
+            ssh_host: None,
+            enabled: false,
+        });
+        a.state.make.ai = Some("Off".into());
+        a
+    });
+    h.run_steps(3);
+    // The stale draft goes back to Automatic, and the toast says who builds instead.
+    assert!(h.state().state.make.ai.is_none());
+    assert_eq!(h.get_all_by_label("Built by").last().unwrap().value().as_deref(), Some("Automatic (Claude)"));
+    assert!(h.state().state.toasts.iter().any(|(t, err)| !*err && t.contains("Off") && t.contains("Claude")), "{:?}", h.state().state.toasts);
+}
+
+#[test]
+fn a_turned_off_or_removed_saved_builder_says_who_builds_instead() {
+    let mut h = harness(|| {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.backends.push(BackendConfig {
+            name: "Off".into(),
+            kind: BackendKind::Anthropic,
+            model: "test-model".into(),
+            base_url: None,
+            ssh_host: None,
+            enabled: false,
+        });
+        a
+    });
+    h.run_steps(2);
+
+    // A turned-off saved builder: the default builds, and the person is told which one.
+    assert_eq!(h.state_mut().builder_backend(Some("Off")).as_deref(), Some("Claude"));
+    assert!(h.state().state.toasts.iter().any(|(t, err)| !*err && t.contains("Off") && t.contains("Claude")), "{:?}", h.state().state.toasts);
+
+    // A removed one too.
+    assert_eq!(h.state_mut().builder_backend(Some("Gone")).as_deref(), Some("Claude"));
+    assert!(h.state().state.toasts.iter().any(|(t, err)| !*err && t.contains("Gone") && t.contains("Claude")), "{:?}", h.state().state.toasts);
+
+    // An enabled choice, and Automatic, say nothing.
+    let quiet = h.state().state.toasts.len();
+    assert_eq!(h.state_mut().builder_backend(Some("Claude")).as_deref(), Some("Claude"));
+    assert_eq!(h.state_mut().builder_backend(None).as_deref(), Some("Claude"));
+    assert_eq!(h.state().state.toasts.len(), quiet, "no replacement notice when nothing was replaced");
+}
+
+#[test]
 fn with_nothing_to_build_with_start_offers_what_was_found_instead_of_a_dead_end() {
     use craft_anything_ui_egui::state::Modal;
     let mut h = harness(|| {
@@ -2351,6 +3151,114 @@ fn only_the_claude_desktop_app_is_named_when_nothing_can_build() {
     h.run_steps(2);
     h.get_by_label("No coding agent was found on this computer yet.");
     h.get_by_label("The Claude desktop app is installed, but building needs Claude Code, its separate command-line tool. Install Claude Code, sign in to it once in a terminal, then look again.");
+
+    // Agents suggested from `~/.ssh/config` aren't checked, so the hint stays (review of #781).
+    use craft_anything_ai::{BackendConfig, Detected};
+    let remote = |name: &str| Detected {
+        suggestion: BackendConfig {
+            name: name.into(),
+            kind: craft_anything_ai::BackendKind::AgentCli,
+            model: "claude-code".into(),
+            base_url: None,
+            ssh_host: Some("box".into()),
+            enabled: true,
+        },
+        reason: "From ~/.ssh/config".into(),
+        needs_key: false,
+    };
+    h.state_mut().detected = Some(vec![remote("Claude Code on box")]);
+    h.run_steps(2);
+    h.get_by_label("The Claude desktop app is installed, but building needs Claude Code, its separate command-line tool. Install Claude Code, sign in to it once in a terminal, then look again.");
+    // An agent found on this computer can build, so the hint goes.
+    let mut local = remote("Codex");
+    local.suggestion.ssh_host = None;
+    local.suggestion.model = "codex".into();
+    h.state_mut().detected = Some(vec![remote("Claude Code on box"), local]);
+    h.run_steps(2);
+    assert!(h.query_by_label("The Claude desktop app is installed, but building needs Claude Code, its separate command-line tool. Install Claude Code, sign in to it once in a terminal, then look again.").is_none());
+}
+
+/// The discovery tabs and Detect action stay separate and evenly spaced in Settings → AI.
+#[test]
+fn ai_discovery_controls_have_even_spacing() {
+    for (width, mode, count) in [(760.0, Mode::Beginner, 0), (900.0, Mode::Experienced, 0), (1280.0, Mode::Beginner, 12), (1280.0, Mode::Experienced, 12)] {
+        let mut h = harness_sized(egui::vec2(width, 1000.0), move || {
+            let mut a = demo::app(demo::engine(mode, true));
+            a.backends.clear();
+            a.detected = Some(
+                [BackendKind::Openai, BackendKind::AgentCli]
+                    .into_iter()
+                    .flat_map(|kind| {
+                        (0..count).map(move |i| craft_anything_ai::Detected {
+                            suggestion: BackendConfig {
+                                name: format!("Fixture {kind:?} {i}"),
+                                kind,
+                                model: "fixture".into(),
+                                base_url: None,
+                                ssh_host: None,
+                                enabled: true,
+                            },
+                            reason: "Controlled discovery result".into(),
+                            needs_key: false,
+                        })
+                    })
+                    .collect(),
+            );
+            a.state.settings_open = true;
+            a.state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Ai;
+            a
+        });
+        h.run_steps(4);
+        let providers = h.get_by_label(&format!("Providers ({count})")).rect();
+        let harnesses = h.get_by_label(&format!("Harnesses ({count})")).rect();
+        let detect = h.get_by_label("Detect").rect();
+        assert!(!providers.intersects(detect) && !harnesses.intersects(detect), "controls overlap at {width}: {providers:?}, {harnesses:?}, {detect:?}");
+        let tab_gap = harnesses.left() - providers.right();
+        let action_gap = detect.left() - harnesses.right();
+        assert!(tab_gap > 0.0 && action_gap > 0.0, "controls need a visible gap at {width}");
+        assert!((tab_gap - action_gap).abs() <= 1.0, "spacing differs at {width}: {tab_gap} vs {action_gap}");
+        assert!(providers.top() < detect.bottom() && detect.top() < providers.bottom(), "controls share a row at {width}");
+        h.get_by_label(&format!("Harnesses ({count})")).click();
+        h.run_steps(2);
+        assert_eq!(h.state().state.detect_tab, Some(craft_anything_ui_egui::detect_tabs::DetectTab::Harnesses));
+    }
+}
+
+/// A long reason on a card for an AI found on this computer wraps beside its Add button; it used
+/// to stay on one line and run on under the button.
+#[test]
+fn a_found_ais_long_reason_wraps_beside_its_add_button() {
+    use craft_anything_ai::Detected;
+    let reason = "Found the claude command on this computer, in a folder that another account's settings also point at, so adding it here uses the same sign-in as that one.";
+    let found = Detected {
+        suggestion: BackendConfig {
+            name: "Claude Code".into(),
+            kind: BackendKind::AgentCli,
+            model: "claude-code".into(),
+            base_url: None,
+            ssh_host: None,
+            enabled: true,
+        },
+        reason: reason.into(),
+        needs_key: false,
+    };
+    let mut h = harness_sized(egui::vec2(900.0, 1000.0), move || {
+        let mut a = demo::app(demo::engine(Mode::Experienced, true));
+        a.backends.clear();
+        a.detected = Some(vec![found]);
+        // The fixture is the discovery result; keep host detection out of this UI test.
+        a.detecting = true;
+        a.state.settings_open = true;
+        a.state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Ai;
+        a
+    });
+    h.run_steps(4);
+    let text = h.get_by_label(reason).rect();
+    // The card's Add is the one on the reason's lines (the address form below has one too).
+    let add = h.query_all_by_label("Add").map(|n| n.rect()).find(|r| r.top() < text.bottom() && r.bottom() > text.top() - 30.0);
+    let add = add.expect("the card has an Add button beside its text");
+    assert!(text.right() <= add.left(), "the reason ({text:?}) ends before the Add button ({add:?})");
+    assert!(text.height() > 20.0, "the reason wraps onto more than one line ({text:?})");
 }
 
 #[test]
@@ -2375,6 +3283,44 @@ fn an_ai_can_be_turned_off_and_removed_in_settings() {
     h.run_steps(2);
     h.get_by_label("Remove it and its key").click();
     assert!(wait(&mut h, |a| a.backends.is_empty()), "removed");
+}
+
+/// A key save for a backend is still running: its Remove must not start, or the save can write
+/// the key back after the backend and its key are gone.
+#[test]
+fn a_backend_cant_be_removed_while_its_key_is_being_saved() {
+    let mut h = harness(|| {
+        let mut a = demo::app(demo::engine(Mode::Experienced, true));
+        a.hub
+            .add_backend(
+                BackendConfig {
+                    name: "OpenAI test".into(),
+                    kind: BackendKind::Openai,
+                    model: "gpt-test".into(),
+                    base_url: None,
+                    ssh_host: None,
+                    enabled: true,
+                },
+                None,
+            )
+            .unwrap();
+        a.backends = a.hub.backends();
+        a.state.settings_open = true;
+        a.state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Ai;
+        a
+    });
+    h.run_steps(3);
+    h.get_by_label("Remove OpenAI test").click();
+    h.run_steps(2);
+    h.state_mut().backend_key_pending.insert("OpenAI test".into());
+    h.run_steps(2);
+    h.get_by_label("Remove it and its key").click();
+    h.run_steps(3);
+    assert!(h.state().backends.iter().any(|b| b.name == "OpenAI test"), "the backend stays while its key is being saved");
+    h.state_mut().backend_key_pending.remove("OpenAI test");
+    h.run_steps(2);
+    h.get_by_label("Remove it and its key").click();
+    assert!(wait(&mut h, |a| a.backends.iter().all(|b| b.name != "OpenAI test")), "removed once the key save finished");
 }
 
 #[test]
@@ -2693,4 +3639,137 @@ fn a_long_status_note_in_the_work_rows_stays_in_the_window() {
         eprintln!("HEADER {r:?}");
         assert!(r.min.x >= 0.0 && r.max.x <= 1280.0, "the header leaves the window: {r:?}");
     }
+}
+
+/// #983: in a longer language or a narrow window the two switches go on two lines, never over each other.
+#[test]
+fn the_switches_under_the_prompt_box_never_overlap() {
+    let d = tempfile::tempdir().unwrap();
+    let ws = craft_anything_engine::workspace::Workspace::create(d.path(), "Notes", "A notes app", craft_anything_engine::workspace::TargetRef::None).unwrap();
+    for width in [1600.0, 1000.0, 700.0, 560.0] {
+        let ws = ws.clone();
+        let mut h = harness_sized(egui::vec2(width, 800.0), move || {
+            let mut a = demo::app(demo::engine(Mode::Beginner, true));
+            a.workspace = Some(ws);
+            a.state.screen = Screen::Project;
+            a
+        });
+        h.run_steps(3);
+        let sending = h.get_by_label("Just ask").rect();
+        let (asking, title) = (h.get_by_label("Ask me").rect(), h.get_by_label("Builder's questions:").rect());
+        let hint = h.get_by_label("or start with /btw to just ask").rect();
+        assert!(!sending.intersects(title) && !sending.intersects(asking), "at {width}: {sending:?}, {title:?}, {asking:?}");
+        assert!(!hint.intersects(title) && !hint.intersects(asking), "at {width}: {hint:?}, {title:?}, {asking:?}");
+        assert!(title.left() >= 0.0 && asking.right() <= width, "at {width} they stay in the window: {title:?}, {asking:?}");
+    }
+}
+
+#[test]
+fn a_very_long_app_file_name_keeps_start_inside_the_window() {
+    use craft_anything_engine::workspace::TargetRef;
+    let name = format!("{}.apk", "com.example.some-very-long-apkmirror-name-".repeat(5));
+    let path = std::path::PathBuf::from(name);
+    let mut h = harness(move || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        demo::fill_projects(&mut a);
+        a.state.make.target = TargetRef::Local { path };
+        a.state.make.game = false;
+        a
+    });
+    h.run_steps(4);
+    let content = h.ctx.content_rect();
+    let start = h.get_by_label("Start").rect();
+    assert!(start.left() >= 0.0 && start.right() <= content.right(), "Start ({start:?}) stays inside the window ({content:?})");
+}
+
+/// #1300: the app's version can be seen on every system, under Settings → About at the bottom of
+/// the tab list (only macOS has an About in its menu bar).
+#[test]
+fn settings_about_shows_the_apps_version() {
+    let mut h = harness(|| {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.state.settings_open = true;
+        a
+    });
+    h.run_steps(3);
+    let safety = h.get_by_label("Safety").rect();
+    let about = h.get_by_label("About").rect();
+    assert!(about.top() > safety.bottom() + 40.0, "About sits apart at the bottom of the list");
+    h.get_by_label("About").click();
+    h.run_steps(3);
+    let version = format!("Version {}", env!("CARGO_PKG_VERSION"));
+    h.get_by_label(&version);
+    // A button copies it, so a keyboard can too (selectable labels aren't in egui's Tab order).
+    h.get_by_label("Copy the version").click();
+    h.step();
+    let copied = h.output().platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(t) if *t == version));
+    assert!(copied, "the button copies the version");
+
+    // The keyboard path: Tab from the About tab reaches the button, and Enter or Space copies.
+    // `key_press` queues the key's press and release, and `step` runs a frame for each, so the
+    // press is sent alone to read the frame it lands in.
+    h.get_by_label("About").focus();
+    h.run_steps(2);
+    h.key_press(egui::Key::Tab);
+    h.run_steps(2);
+    assert!(h.get_by_label("Copy the version").is_focused(), "Tab reaches the copy button");
+    for key in [egui::Key::Enter, egui::Key::Space] {
+        let event = |pressed| egui::Event::Key { key, pressed, modifiers: egui::Modifiers::NONE, repeat: false, physical_key: None };
+        h.event(event(true));
+        h.step();
+        let copied = h.output().platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(t) if *t == version));
+        assert!(copied, "{key:?} on the button copies the version");
+        h.event(event(false));
+        h.step();
+    }
+}
+
+/// A workspace member's build lands in the workspace's `target/`, outside the app: the Project
+/// screen finds it by reading the files (no process is started for it), so Play and "Pin this
+/// build" show. Another project's program of the same name there doesn't count.
+#[test]
+fn a_workspace_members_build_shows_play_on_the_project_screen() {
+    use craft_anything_engine::workspace::{TargetRef, Workspace};
+    let d = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(&d.path().join("projects"), "Snake", "A snake game in Rust", TargetRef::None).unwrap();
+    std::fs::write(ws.root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n").unwrap();
+    let app = ws.app_dir();
+    std::fs::create_dir_all(app.join("src")).unwrap();
+    std::fs::write(app.join("Cargo.toml"), "[package]\nname = \"snake\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    std::fs::write(app.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let exe = if cfg!(windows) { "snake.exe" } else { "snake" };
+    let program = ws.root.join("target/debug").join(exe);
+    std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+    std::fs::write(&program, "x").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let record = |source: &std::path::Path| {
+        let source = std::path::absolute(source).unwrap();
+        std::fs::write(program.with_extension("d"), format!("{}: {}\n", program.display(), source.display())).unwrap();
+    };
+    let other = d.path().join("other/src/main.rs");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    std::fs::write(&other, "fn main() {}\n").unwrap();
+    record(&other);
+    let (decoy_ws, root) = (ws.clone(), ws.root.clone());
+    let mut h = harness(move || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.open_workspace(decoy_ws);
+        a
+    });
+    assert!(wait(&mut h, |a| a.facts.root == root), "the project is read");
+    assert!(!h.state().facts.program, "another project's program of that name isn't this one's");
+
+    record(&app.join("src/main.rs"));
+    let mut h = harness(move || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.open_workspace(ws);
+        a
+    });
+    assert!(wait(&mut h, |a| a.facts.program), "the member's build is found");
+    h.run_steps(2);
+    h.get_by_label("Pin this build");
 }

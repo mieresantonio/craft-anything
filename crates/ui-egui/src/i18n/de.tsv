@@ -1,5 +1,6 @@
 # de: original German UI translations (informal "du"). Licensed MIT OR Apache-2.0.
 # UTF-8: English source<TAB>translation. Keep placeholders and escapes intact.
+Default (its own settings)	Standard (eigene Einstellungen)
 OpenCode default	OpenCode-Standard
 Model default	Modellstandard
 Thinking depth	Denktiefe
@@ -304,6 +305,7 @@ Couldn't look through that folder.	Dieser Ordner konnte nicht durchsucht werden.
 Couldn't open it.	Konnte nicht geöffnet werden.
 Couldn't open the folder.	Der Ordner konnte nicht geöffnet werden.
 Couldn't open {}: {}	{} konnte nicht geöffnet werden: {}
+Couldn't save your settings.	Die Einstellungen konnten nicht gespeichert werden.
 Couldn't start a worker thread: {e}	Ein Arbeits-Thread konnte nicht gestartet werden: {e}
 Couldn't start it.	Konnte nicht gestartet werden.
 Coverage unknown	Abdeckung unbekannt
@@ -893,6 +895,7 @@ Read a Unity game's IL2CPP metadata	Die IL2CPP-Metadaten eines Unity-Spiels lese
 Read a game's files	Die Dateien eines Spiels lesen
 Read a project file	Eine Projektdatei lesen
 Read a setting	Eine Einstellung lesen
+Read a text file	Eine Textdatei lesen
 Read an app's screen	Den Bildschirm einer App lesen
 Read bytes	Bytes lesen
 Read comment	Kommentar lesen
@@ -985,6 +988,7 @@ Saved in	Gespeichert in
 Saves space: copies the program and code, and shares dependencies and media with the project. A shared file rewritten in place changes here too.	Spart Platz: kopiert das Programm und den Code und teilt Abhängigkeiten und Medien mit dem Projekt. Eine geteilte Datei, die an Ort und Stelle überschrieben wird, ändert sich auch hier.
 Say what you want	Sag, was du willst
 Say what you want first.	Sag zuerst, was du willst.
+This applies once you choose something to recreate above.	Das gilt, sobald du oben etwas zum Nachbauen auswählst.
 Say what you want to make, or drop an app or file on the window to look inside it. Everything runs in Clean room mode unless you switch on Deep.	Sag, was du machen willst, oder zieh eine App oder Datei auf das Fenster, um hineinzusehen. Alles läuft im Clean-Room-Modus, solange du Deep nicht einschaltest.
 Screenshot	Screenshot
 Screenshot a page	Screenshot einer Seite
@@ -1190,6 +1194,7 @@ Use the projects folder	Den Projektordner verwenden
 Use this	Dieses verwenden
 Use {name}	{name} verwenden
 Value flow	Werteverlauf
+About	Über
 Version	Version
 Waiting	Wartet
 Waiting for another build to finish: this one starts next.	Wartet, bis ein anderer Build fertig ist: Dieser startet als Nächstes.
@@ -1365,6 +1370,7 @@ your files there are the app, edited in place	deine Dateien dort sind die App, d
 {name} builds what you make; answers come from {brain}.	{name} baut, was du machst; Antworten kommen von {brain}.
 {name} can't be attached: a message takes pictures up to 20 MB.	{name} kann nicht angehängt werden: Eine Nachricht nimmt Bilder bis 20 MB.
 {name} can't be attached: it isn't a PNG, JPEG, GIF or WebP picture.	{name} kann nicht angehängt werden: Es ist kein PNG-, JPEG-, GIF- oder WebP-Bild.
+{name} can't be kept to only reading, so it isn't asked questions. Ask with Claude Code, or with an AI that has an API key.	{name} lässt sich nicht aufs reine Lesen beschränken, deshalb bekommt es keine Fragen. Frag mit Claude Code oder mit einer KI, die einen API-Schlüssel hat.
 {name} is ready	{name} ist bereit
 {name} is ready.	{name} ist bereit.
 {name} isn't available yet in this build.	{name} ist in diesem Build noch nicht verfügbar.
@@ -1444,3 +1450,55 @@ Zoom	Zoomen
 Bring all to front	Alle nach vorne bringen
 Drag to give the plan more or less room; double-click to reset	Ziehen, um dem Plan mehr oder weniger Platz zu geben; Doppelklick setzt zurück
 Copy the message	Die Nachricht kopieren
+Copy the version	Die Version kopieren
+Choose what the builder's approvals get	Festlegen, was die Freigaben des Builders erhalten
+Reading the web	Im Web lesen
+Other commands	Andere Befehle
+Files outside the project	Dateien außerhalb des Projekts
+Pushing and publishing	Pushen und Veröffentlichen
+Deleting outside the project	Löschen außerhalb des Projekts
+System changes	Systemänderungen
+Other tools	Andere Werkzeuge
+Allow	Erlauben
+Ask	Fragen
+Refuse	Ablehnen
+After /approvals, type a kind and allow, ask, refuse or default, like /approvals publish ask. Kinds: {kinds}.	Tippe nach /approvals eine Art und allow, ask, refuse oder default, zum Beispiel /approvals publish ask. Arten: {kinds}.
+There's no kind called {name}. Kinds: {kinds}.	Es gibt keine Art namens {name}. Arten: {kinds}.
+Approvals	Freigaben
+In this project, {kind}: {choice}.	In diesem Projekt {kind}: {choice}.
+Couldn't change the approvals:	Die Freigaben konnten nicht geändert werden:
+What the builder may do without asking you, in this project.	Was der Builder in diesem Projekt tun darf, ohne dich zu fragen.
+Default follows Auto mode: with it on, what can be undone goes ahead and the rest is refused; with it off, the builder asks.	Standard folgt dem Automatikmodus: Ist er an, geschieht, was sich rückgängig machen lässt, und der Rest wird abgelehnt; ist er aus, fragt der Builder.
+Connecting to {name}… {seconds} s	Verbinde mit {name}… {seconds} s
+Stopped adding {name}.	Hinzufügen von {name} abgebrochen.
+It isn't there any more, so {program} runs in its place.	Es ist nicht mehr dort, daher läuft stattdessen {program}.
+Use it	Verwenden
+
+# Native update checks and verified installation.
+ArtCraft Launcher manages this app's version. Change its version there.	ArtCraft Launcher verwaltet die Version dieser App. Ändere die Version dort.
+Check again	Erneut prüfen
+Check for Updates	Nach Updates suchen
+Check for Updates…	Nach Updates suchen…
+Checking for updates…	Suche nach Updates…
+Couldn't check for updates: {error}	Updates konnten nicht geprüft werden: {error}
+Downloading and verifying the update…	Update wird heruntergeladen und überprüft…
+No installer is available for this platform.	Für diese Plattform ist kein Installationsprogramm verfügbar.
+Releases	Veröffentlichungen
+Save your work and stop running tasks before installing an update.	Speichere deine Arbeit und beende laufende Aufgaben, bevor du ein Update installierst.
+The update failed: {error}	Das Update ist fehlgeschlagen: {error}
+The update worker stopped unexpectedly. Try checking again.	Der Update-Prozess wurde unerwartet beendet. Prüfe erneut auf Updates.
+This installation is managed externally. Update it with its package manager or open Releases.	Diese Installation wird extern verwaltet. Aktualisiere sie mit der Paketverwaltung oder öffne die Veröffentlichungen.
+Update and restart	Aktualisieren und neu starten
+Update ready. Restarting…	Update bereit. Neustart…
+Updated to {version}.	Auf {version} aktualisiert.
+Use Releases or your package manager to update this installation.	Aktualisiere diese Installation über die Veröffentlichungen oder deine Paketverwaltung.
+You're up to date.	Du bist auf dem neuesten Stand.
+{version} is available.	{version} ist verfügbar.
+Forget a website sign-in	Anmeldung bei einer Website vergessen
+Sign in to a website	Bei einer Website anmelden
+Some shared files could not be hard-linked and were copied instead ({size}).	Einige geteilte Dateien konnten nicht hart verlinkt werden und wurden kopiert ({size}).
+This server lists several chat models. Choose one:	Dieser Server bietet mehrere Chat-Modelle an. Wähle eines:
+Choose a model	Modell wählen
+
+# Saved-builder notice: English until native-speaker review.
+The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.	The AI chosen for this project ({saved}) is turned off or no longer set up. {used} builds instead.

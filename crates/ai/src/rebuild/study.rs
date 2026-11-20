@@ -3,8 +3,71 @@
 
 use super::*;
 
+/// An Electron program is the Chromium and Node runtime, and analysing that takes hours: the app's
+/// own logic is the JavaScript in `resources/app.asar` beside it, which the study maps (#947).
+pub(super) fn is_electron_runtime(program: &Path) -> bool {
+    program.parent().is_some_and(|dir| dir.join("resources/app.asar").is_file())
+}
+
+/// Whether runtime study may start the program: only one this computer can start. A Windows `.exe`
+/// found in a game's folder on Linux or macOS is studied ([`studies_as_program`]), never started.
+pub(super) fn may_start(program: &Path) -> bool {
+    program.is_file() && is_program(program)
+}
+
+/// The program a later run reopens for its builder: the one the study looked at, in Deep mode on a
+/// local target, when it is still there. None otherwise (Clean room never opens the original).
+pub(super) fn program_to_reopen(target: &TargetRef, kind: &dyn TargetKind, deep: bool) -> Option<PathBuf> {
+    // Clean room is decided first: locating the program reads the original's folder.
+    if !deep {
+        return None;
+    }
+    let TargetRef::Local { path } = target else { return None };
+    let program = locate(path, kind.studies_folder()).0;
+    program.exists().then_some(program)
+}
+
+/// The builder's tools run on another computer: a coding agent over SSH starts its own tool
+/// server there. An API builder over SSH (a tunnelled model) still calls tools in this process.
+pub(super) fn tools_run_remotely(over_ssh: bool, api_loop: bool) -> bool {
+    over_ssh && !api_loop
+}
+
 impl Worker {
-    pub(super) fn study(&mut self, ws: &mut Workspace, kind: &dyn TargetKind) -> Result<(), ToolError> {
+    /// A run after the first skips the study, so its session has nothing open and the builder's
+    /// first `native_*` calls said "Nothing is open yet" (#1421). Open what the study looked at, so
+    /// the builder's tool server gets it. A failure only says why: the builder can still open it.
+    /// `remote`: the builder's tools run on another computer ([`tools_run_remotely`]), whose tool
+    /// server isn't handed this computer's targets, so opening (and hashing) it here helps nothing.
+    /// `deep`: this run's mode, the same read that decided its capture is usable.
+    pub(super) fn reopen_target(&mut self, ws: &mut Workspace, kind: &dyn TargetKind, remote: bool, deep: bool) -> Result<(), ToolError> {
+        if remote {
+            return Ok(());
+        }
+        // Nothing to look for when something is open already.
+        if !self.engine.session().shared_targets().is_empty() {
+            return Ok(());
+        }
+        let Some(program) = program_to_reopen(&ws.manifest.target, kind, deep) else { return Ok(()) };
+        if let Err(e) = self.call("core_target_open", json!({"path": program.display().to_string()})) {
+            if e.code == ErrorCode::Cancelled {
+                return Err(e);
+            }
+            self.step(ws, Step::Build, Status::Building, &format!("Couldn't open {} again for the builder: {}", program.display(), e.message))?;
+        }
+        Ok(())
+    }
+
+    /// Look at the target before the first build. `deep` is this run's mode, fixed at its start:
+    /// the notes and the capture's recorded mode both come from it.
+    pub(super) fn study(&mut self, ws: &mut Workspace, kind: &dyn TargetKind, deep: bool) -> Result<(), ToolError> {
+        // The capture about to be written belongs to this run's mode. Clear the old record first:
+        // a study that fails partway must not leave a capture a later run trusts.
+        ws.manifest.capture_deep = None;
+        ws.save()?;
+        if !deep {
+            remove_deep_only(&ws.capture_dir())?;
+        }
         match ws.manifest.target.clone() {
             TargetRef::Website { url } => {
                 self.step(ws, Step::Study, Status::Inspecting, &format!("Opening {url} in a private browser…"))?;
@@ -29,11 +92,11 @@ impl Worker {
                     }
                 }
                 self.capture_routes(ws, &url, &widths)?;
-                if !self.engine.session().clean_room() {
+                if deep {
                     self.how_it_works(ws, &url)?;
                 }
             }
-            TargetRef::Local { path } if self.engine.session().clean_room() => self.study_from_outside(ws, &path)?,
+            TargetRef::Local { path } if !deep => self.study_from_outside(ws, &path)?,
             TargetRef::Local { path } => {
                 self.step(ws, Step::Study, Status::Inspecting, "Looking inside it (nothing is run)…")?;
                 let (program, folder) = locate(&path, kind.studies_folder());
@@ -45,7 +108,7 @@ impl Worker {
                     Ok(out) => notes.push_str(&describe(&out)),
                     Err(e) => notes.push_str(&format!("A first look failed: {}\n", e.message)),
                 }
-                if !program.is_file() && !self.engine.session().clean_room() {
+                if !program.is_file() && deep {
                     self.step(
                         ws,
                         Step::Study,
@@ -54,7 +117,7 @@ impl Worker {
                     )?;
                     notes.push_str(&format!("\n## Ghidra\n\nNo program was found in {}, so Ghidra couldn't be used.\n", path.display()));
                 }
-                if let Some(done) = self.prepare_ghidra(&program) {
+                if let Some(done) = self.prepare_ghidra(&program, &ws.root) {
                     // Deep mode always waits for Ghidra: the builder then decompiles with it straight away.
                     let started = std::time::Instant::now();
                     // One line: the app's progress card shows how long it has been going.
@@ -86,8 +149,14 @@ impl Worker {
                     }
                     notes.push_str(&inventory(&f));
                 }
-                let is_js = path.extension().is_some_and(|e| e == "asar") || path.join("resources/app.asar").exists() || path.join("package.json").exists();
-                if is_js && let Ok(out) = self.call("js_app_map", json!({"input_path": path.display().to_string(), "limit": 50})) {
+                // A program's app.asar or package.json sits beside it, so look in its folder too.
+                let js_root = if program.is_file() { program.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf) } else { None };
+                let packaged = |root: &Path| root.join("resources/app.asar").exists() || root.join("package.json").exists();
+                let js_input =
+                    if path.extension().is_some_and(|e| e == "asar") || packaged(&path) { Some(path.clone()) } else { js_root.filter(|r| packaged(r)) };
+                if let Some(input) = js_input
+                    && let Ok(out) = self.call("js_app_map", json!({"input_path": input.display().to_string(), "limit": 50}))
+                {
                     notes.push_str("\n## JavaScript application\n\n");
                     notes.push_str(&describe(&out));
                 }
@@ -95,7 +164,7 @@ impl Worker {
                 std::fs::create_dir_all(&capture).map_err(|e| ToolError::io(capture.display(), e))?;
                 let runtime = self.engine.session().settings.runtime_study;
                 let mut console = false;
-                if runtime && program.is_file() && kinds::runs::is_console(&program) {
+                if runtime && may_start(&program) && kinds::runs::is_console(&program) {
                     // A console program draws no window: run it with each input instead.
                     self.step(ws, Step::Study, Status::Inspecting, "Running it with a few inputs to see what it prints…")?;
                     if let Some(section) = self.capture_runs(&program, &capture)? {
@@ -103,7 +172,7 @@ impl Worker {
                         console = true;
                     }
                 }
-                if !console && runtime && program.is_file() && is_program(&program) {
+                if !console && runtime && may_start(&program) {
                     notes.push_str(&self.picture_window(ws, &program, &capture)?);
                 }
                 craft_anything_engine::project::write_atomic(&capture.join("README.md"), notes.as_bytes())?;
@@ -114,6 +183,8 @@ impl Worker {
                 craft_anything_engine::project::write_atomic(&capture.join("README.md"), b"# No target\n\nBuild from the request alone.\n")?;
             }
         }
+        ws.manifest.capture_deep = Some(deep);
+        ws.save()?;
         Ok(())
     }
 
@@ -136,6 +207,30 @@ impl Worker {
                 Err(e) => format!("{tool} didn't work: {}\n", e.message),
             });
         }
+        // A recording of the start page's traffic, with the answers it gave, so a rebuilt front end
+        // can be given a stand-in backend (#1838). The run already watches it; this keeps the bodies
+        // within their own cap, with declared secrets and credential headers redacted as
+        // everywhere else. Request bodies are kept too, so two operations sent to one endpoint (a
+        // GraphQL POST, say) can be told apart when the stand-in answers them. A failure is said in
+        // the notes, not fatal to the study.
+        match self.call("web_walkthrough_record", recording_params(url)) {
+            Ok(ToolOutput::Evidence(evidence)) => {
+                let requests = evidence.result.pointer("/network/requests").and_then(Value::as_array).cloned().unwrap_or_default();
+                let file = ws.capture_dir().join(RECORDING);
+                match craft_anything_engine::tools::browser_tools::write_recording(&requests, &file) {
+                    Ok(()) => notes.push_str(&format!(
+                        "\n## A recording of its traffic\n\ncapture/{RECORDING} holds {} request(s) and the answers the site gave while we watched: a stand-in backend built from it (web_standin_build) answers your front end the way the original did.\n",
+                        requests.len()
+                    )),
+                    Err(e) => notes.push_str(&format!("\n## A recording of its traffic\n\nWriting it didn't work: {}\n", e.message)),
+                }
+            }
+            Ok(_) => notes.push_str(&format!("\n## A recording of its traffic\n\nNothing was recorded, so there's no recording in capture/{RECORDING}.\n")),
+            Err(e) => notes.push_str(&format!(
+                "\n## A recording of its traffic\n\nRecording it didn't work ({}), so there's no recording in capture/{RECORDING}.\n",
+                e.message
+            )),
+        }
         craft_anything_engine::project::write_atomic(&ws.capture_dir().join(HOW_IT_WORKS), notes.as_bytes())
     }
 
@@ -151,7 +246,7 @@ impl Worker {
             path.display()
         );
         let runtime = self.engine.session().settings.runtime_study;
-        if runtime && path.is_file() && is_program(path) {
+        if runtime && may_start(path) {
             notes.push_str(&self.picture_window(ws, path, &capture)?);
         }
         craft_anything_engine::project::write_atomic(&capture.join("README.md"), notes.as_bytes())
@@ -165,7 +260,7 @@ impl Worker {
         let tree = capture.join("ui-tree.json");
         let params =
             json!({"program": program.display().to_string(), "wait_secs": 15, "output": shot.display().to_string(), "ui_tree": tree.display().to_string()});
-        let picture = "capture/window.png is a picture of its window 15 seconds after it started. Open it with the Read tool: match its layout, colours and proportions.\n";
+        let picture = "capture/window.png is a picture of its window 15 seconds after it started: match its layout, colours and proportions.\n";
         let mut notes = String::from("\n## How it looks running\n\n");
         notes.push_str(&match self.call("native_window_capture", params) {
             Ok(_) if tree.is_file() => format!(
@@ -230,9 +325,10 @@ impl Worker {
     /// Deep mode with Ghidra installed: run Ghidra's one-time analysis of `program` on its own
     /// thread; the receiver gets its result. The builder's tools share the analysis (waiting for it
     /// rather than starting another), and it carries on if the person pauses, so nothing is lost.
-    pub(super) fn prepare_ghidra(&self, program: &Path) -> Option<Receiver<Result<(), String>>> {
+    /// It stops once `project`'s record is gone: a deleted project needs it no more (#948).
+    pub(super) fn prepare_ghidra(&self, program: &Path, project: &Path) -> Option<Receiver<Result<(), String>>> {
         // A folder (nothing in it recognised as the program) isn't something Ghidra can open.
-        if !program.is_file() {
+        if !program.is_file() || is_electron_runtime(program) {
             return None;
         }
         let settings = {
@@ -243,13 +339,27 @@ impl Worker {
             s.settings.clone()
         };
         let program = program.to_path_buf();
+        let record = project.join(craft_anything_engine::workspace::MANIFEST);
         let (tx, rx) = std::sync::mpsc::channel();
+        let (feed, events, wake) = (self.feed.clone(), self.tx.clone(), self.wake.clone());
         std::thread::Builder::new()
             .name("ghidra-prepare".into())
             .spawn(move || {
                 let result = std::fs::read(&program).map_err(|e| e.to_string()).and_then(|bytes| {
                     let sha = craft_anything_evidence::sha256_hex(&bytes);
-                    craft_anything_engine::tools::deep::prepare(&settings, &bytes, &sha, &|_| {})
+                    // Said in the feed (once per change), so a wait for an earlier analysis shows.
+                    let last = Mutex::new(String::new());
+                    let said = |m: &str| {
+                        let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
+                        if *last != m {
+                            *last = m.to_string();
+                            emit_event(&feed, &events, &wake, RunEvent::Step { step: Step::Study, text: m.to_string() });
+                        }
+                    };
+                    craft_anything_engine::tools::deep::prepare(&settings, &bytes, &sha, &said, &|| {
+                        // Only a record known to be gone: a drive that can't be read for a moment isn't a delete.
+                        matches!(record.try_exists(), Ok(false))
+                    })
                 });
                 if let Err(e) = &result {
                     log::warn!("Ghidra's analysis of {} failed: {e}", program.display());
@@ -263,6 +373,45 @@ impl Worker {
 
 /// Deep mode's notes on how a website works, in capture/.
 pub(super) const HOW_IT_WORKS: &str = "how-it-works.md";
+/// The start page's traffic as a HAR recording, so `web_standin_build` can replay its answers.
+pub(super) const RECORDING: &str = "original.har";
+
+/// The walkthrough that records a website's start page, exactly as `web_walkthrough_record` takes
+/// it: one `goto` step (the actions are told apart by their `kind`, not by an object around them),
+/// and the bodies a stand-in answers from. Kept here so a test can read it as `WalkthroughParams`.
+pub(super) fn recording_params(url: &str) -> serde_json::Value {
+    json!({
+        "actions": [{"kind": "goto", "url": url, "wait_ms": 10_000}],
+        "capture_network": true,
+        "keep_bodies": {"response_body": true, "request_body": true},
+        "timeout_secs": 120,
+    })
+}
+
+/// The rendered HTML a Deep website capture keeps; a Clean room capture records only what a
+/// visitor sees.
+const PAGE_HTML: &str = "page.html";
+
+/// Remove what only a Deep study writes before a Clean room study replaces the capture: its
+/// builder must not find what only Deep mode may see. A missing file is fine; any other failure
+/// stops the study rather than leave it behind.
+fn remove_deep_only(capture: &Path) -> Result<(), ToolError> {
+    for file in [HOW_IT_WORKS, PAGE_HTML] {
+        let path = capture.join(file);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(ToolError::io(path.display(), e)),
+        }
+    }
+    let runs = capture.join(kinds::runs::RUNS_DIR);
+    match std::fs::remove_dir_all(&runs) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(ToolError::io(runs.display(), e)),
+    }
+    Ok(())
+}
 
 /// A short text view of a tool result for the study notes.
 pub(super) fn describe(out: &ToolOutput) -> String {
